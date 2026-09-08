@@ -1,0 +1,22 @@
+[package]
+name = "terminal-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+open.workspace = true
+pollster.workspace = true
+serde.workspace = true
+terminal-core = { path = "../terminal-core" }
+terminal-pty = { path = "../terminal-pty" }
+terminal-renderer = { path = "../terminal-renderer" }
+toml.workspace = true
+winit.workspace = true
+
+[[bin]]
+name = "grin"
+path = "src/main.rs"
