@@ -26,6 +26,8 @@ pub struct TabState {
     pub focused_pane: PaneId,
     pub zoomed_pane: Option<PaneId>,
     pub panes: Vec<PaneState>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -134,6 +136,7 @@ mod tests {
             theme: "dark".into(),
             tabs: vec![TabState {
                 title: "one".into(),
+                pinned: false,
                 root: PaneTree::leaf(PaneId(1)),
                 focused_pane: PaneId(1),
                 zoomed_pane: None,

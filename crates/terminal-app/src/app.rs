@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -20,9 +20,9 @@ use winit::{
 use crate::{
     action::{Action, KeyBindings, KeyChord},
     config::{AppConfig, ThemePalette, workspace_path},
-    layout::{Direction, PaneId, Rect, SplitAxis},
+    layout::{Direction, PaneId, Rect, SplitAxis, SplitHandle},
     session::{TabSession, TerminalPane},
-    workspace::{WORKSPACE_VERSION, Workspace},
+    workspace::{TabState, WORKSPACE_VERSION, Workspace},
 };
 
 enum UserEvent {
@@ -32,10 +32,11 @@ enum UserEvent {
         target: SpawnTarget,
         result: Result<TerminalPane, String>,
     },
+    TabRestored(Result<TabSession, String>),
 }
 
 enum SpawnTarget {
-    NewTab,
+    NewTab { title: Option<String> },
     Split { source: PaneId, axis: SplitAxis },
 }
 
@@ -46,12 +47,35 @@ struct InitialSessions {
     diagnostic: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct PendingSelection {
+    pane: PaneId,
+    row: usize,
+    column: usize,
+    position: PhysicalPosition<f64>,
+    rectangular: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MouseClickState {
+    when: Instant,
+    pane: PaneId,
+    position: PhysicalPosition<f64>,
+    count: u8,
+}
+
+struct PaneResizeDrag {
+    handle: SplitHandle,
+    last_position: PhysicalPosition<f64>,
+}
+
 pub struct Application {
     started_at: Instant,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     tabs: Vec<TabSession>,
+    closed_tabs: Vec<TabState>,
     active_tab: usize,
     next_pane_id: u64,
     startup_workspace: Option<Workspace>,
@@ -63,7 +87,17 @@ pub struct Application {
     modifiers: ModifiersState,
     cursor_position: PhysicalPosition<f64>,
     selecting: Option<PaneId>,
+    selection_pending: Option<PendingSelection>,
+    last_left_click: Option<MouseClickState>,
+
+    dragging_tab: Option<usize>,
+    tab_drag_changed: bool,
+
+    resizing_split: Option<PaneResizeDrag>,
+    split_resize_changed: bool,
+
     rename_input: Option<String>,
+    pending_pinned_close: Option<usize>,
     first_shell_output_seen: bool,
     first_frame_seen: bool,
     profile_input: bool,
@@ -106,6 +140,7 @@ impl Application {
             window: None,
             renderer: None,
             tabs: Vec::new(),
+            closed_tabs: Vec::new(),
             active_tab: 0,
             next_pane_id: 1,
             startup_workspace: workspace_load.workspace,
@@ -117,7 +152,17 @@ impl Application {
             modifiers: ModifiersState::empty(),
             cursor_position: PhysicalPosition::new(0.0, 0.0),
             selecting: None,
+            selection_pending: None,
+            last_left_click: None,
+
+            dragging_tab: None,
+            tab_drag_changed: false,
+
+            resizing_split: None,
+            split_resize_changed: false,
+
             rename_input: None,
+            pending_pinned_close: None,
             first_shell_output_seen: false,
             first_frame_seen: false,
             profile_input: std::env::var_os("GRIN_PROFILE_INPUT").is_some(),
@@ -258,7 +303,84 @@ impl Application {
             .as_ref()
             .map(|renderer| renderer.grid_size_for(renderer.content_rect()))
             .unwrap_or((80, 24));
-        self.queue_pane_spawn(SpawnTarget::NewTab, columns, rows, working_directory);
+
+        self.queue_pane_spawn(
+            SpawnTarget::NewTab { title: None },
+            columns,
+            rows,
+            working_directory,
+        );
+    }
+
+    fn queue_duplicate_tab(&mut self) {
+        let (working_directory, title) = {
+            let tab = self.active_tab();
+            (
+                tab.source_directory().to_path_buf(),
+                format!("{} copy", tab.title),
+            )
+        };
+
+        let (columns, rows) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.grid_size_for(renderer.content_rect()))
+            .unwrap_or((80, 24));
+
+        self.queue_pane_spawn(
+            SpawnTarget::NewTab { title: Some(title) },
+            columns,
+            rows,
+            working_directory,
+        );
+    }
+
+    fn queue_restore_closed_tab(&mut self) {
+        let Some(state) = self.closed_tabs.pop() else {
+            return;
+        };
+
+        let cursor_shape = self.config.cursor_shape();
+        let restore_proxy = self.proxy.clone();
+        let event_proxy = self.proxy.clone();
+
+        let spawn = std::thread::Builder::new()
+            .name("tab-restorer".into())
+            .spawn(move || {
+                let result = restore_tab_session(state, cursor_shape, restore_proxy)
+                    .map_err(|error| error.to_string());
+
+                let _ = event_proxy.send_event(UserEvent::TabRestored(result));
+            });
+
+        if let Err(error) = spawn {
+            eprintln!("could not start tab restorer thread: {error}");
+        }
+    }
+
+    fn complete_tab_restore(&mut self, result: Result<TabSession, String>) {
+        let tab = match result {
+            Ok(tab) => tab,
+            Err(error) => {
+                eprintln!("could not restore closed tab: {error}");
+                return;
+            }
+        };
+
+        let target = if tab.pinned {
+            self.tabs.iter().take_while(|tab| tab.pinned).count()
+        } else {
+            self.tabs.len()
+        };
+
+        self.tabs.insert(target, tab);
+        self.active_tab = target;
+
+        self.resize_active_panes();
+        self.process_pty_events();
+        self.persist_workspace();
+        self.update_window_title();
+        self.request_redraw();
     }
 
     fn complete_pane_spawn(&mut self, target: SpawnTarget, result: Result<TerminalPane, String>) {
@@ -270,11 +392,14 @@ impl Application {
             }
         };
         match target {
-            SpawnTarget::NewTab => {
-                self.tabs.push(TabSession::new(
-                    format!("Terminal {}", self.tabs.len() + 1),
-                    pane,
-                ));
+            SpawnTarget::NewTab { title } => {
+                let custom_title = title.is_some();
+                let title = title.unwrap_or_else(|| format!("Terminal {}", self.tabs.len() + 1));
+
+                let mut tab = TabSession::new(title, pane);
+                tab.custom_title = custom_title;
+
+                self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
             }
             SpawnTarget::Split { source, axis } => {
@@ -334,7 +459,18 @@ impl Application {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return false;
         }
+
+        self.pending_pinned_close = None;
+
+        let snapshot = self.tabs[index].snapshot();
         let closed = self.tabs.remove(index);
+
+        self.closed_tabs.push(snapshot);
+
+        if self.closed_tabs.len() > 20 {
+            self.closed_tabs.remove(0);
+        }
+
         if let Some(renderer) = &mut self.renderer {
             for pane in closed.panes.keys() {
                 renderer.remove_pane(pane.0);
@@ -356,9 +492,86 @@ impl Application {
         if index >= self.tabs.len() || index == self.active_tab {
             return;
         }
+        self.pending_pinned_close = None;
         self.active_tab = index;
         self.selecting = None;
         self.resize_active_panes();
+        self.persist_workspace();
+        self.update_window_title();
+        self.request_redraw();
+    }
+
+    fn toggle_active_tab_pin(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        let index = self.active_tab;
+
+        self.tabs[index].pinned = !self.tabs[index].pinned;
+
+        let tab = self.tabs.remove(index);
+
+        let target = if tab.pinned {
+            // Новый pinned tab всегда становится самым первым.
+            0
+        } else {
+            // Unpin: ставим tab сразу после последнего pinned.
+            self.tabs.iter().take_while(|tab| tab.pinned).count()
+        };
+
+        self.tabs.insert(target, tab);
+        self.active_tab = target;
+
+        self.pending_pinned_close = None;
+        self.persist_workspace();
+        self.update_window_title();
+        self.request_redraw();
+    }
+
+    fn confirm_pinned_tab_close(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() || !self.tabs[index].pinned {
+            self.pending_pinned_close = None;
+            return true;
+        }
+
+        if self.pending_pinned_close == Some(index) {
+            self.pending_pinned_close = None;
+            return true;
+        }
+
+        self.pending_pinned_close = Some(index);
+        self.update_window_title();
+        self.request_redraw();
+
+        false
+    }
+
+    fn move_active_tab(&mut self, direction: isize) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+
+        let current = self.active_tab as isize;
+        let target = current + direction;
+
+        if target < 0 || target >= self.tabs.len() as isize {
+            return;
+        }
+
+        let current = current as usize;
+        let target = target as usize;
+
+        // Pinned можно менять местами только с pinned.
+        // Обычные tabs можно менять местами только с обычными.
+        if self.tabs[current].pinned != self.tabs[target].pinned {
+            return;
+        }
+
+        self.tabs.swap(current, target);
+        self.active_tab = target;
+
+        self.pending_pinned_close = None;
         self.persist_workspace();
         self.update_window_title();
         self.request_redraw();
@@ -468,12 +681,188 @@ impl Application {
         }
     }
 
+    fn collapse_keyboard_selection_to_edge(&mut self, toward_right: bool) -> bool {
+        let application_cursor = self.active_tab().focused().terminal.application_cursor();
+
+        let delta = {
+            let screen = self.active_tab_mut().focused_mut().terminal.screen_mut();
+
+            screen.collapse_keyboard_selection(toward_right)
+        };
+
+        let Some(delta) = delta else {
+            return false;
+        };
+
+        self.selecting = None;
+        self.selection_pending = None;
+        self.last_left_click = None;
+
+        if delta != 0 {
+            let final_byte = if delta < 0 { b'D' } else { b'C' };
+
+            let sequence = cursor_sequence(final_byte, application_cursor);
+
+            let steps = delta.unsigned_abs();
+
+            let mut bytes = Vec::with_capacity(sequence.len() * steps);
+
+            for _ in 0..steps {
+                bytes.extend_from_slice(&sequence);
+            }
+
+            self.active_tab().focused().write(bytes);
+        }
+
+        self.request_redraw();
+        true
+    }
+
+    fn handle_selection_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if event.state != ElementState::Pressed || !self.modifiers.shift_key() {
+            return false;
+        }
+
+        // Cmd + Shift оставляем обычным shortcut'ам приложения.
+        if self.modifiers.super_key() {
+            return false;
+        }
+
+        // Во время rename/search keyboard selection не вмешивается.
+        if self.rename_input.is_some() || self.active_tab().focused().search_query.is_some() {
+            return false;
+        }
+
+        let key = match event.logical_key {
+            Key::Named(NamedKey::ArrowLeft) => NamedKey::ArrowLeft,
+            Key::Named(NamedKey::ArrowRight) => NamedKey::ArrowRight,
+            Key::Named(NamedKey::ArrowUp) => NamedKey::ArrowUp,
+            Key::Named(NamedKey::ArrowDown) => NamedKey::ArrowDown,
+            _ => return false,
+        };
+
+        let word_jump = self.modifiers.alt_key() || self.modifiers.control_key();
+
+        {
+            let screen = self.active_tab_mut().focused_mut().terminal.screen_mut();
+
+            let already_selected = screen.selection().is_some();
+
+            if !already_selected {
+                match key {
+                    // Shift + Left:
+                    // сразу выделяем символ слева от cursor.
+                    NamedKey::ArrowLeft => {
+                        if !screen.begin_selection_from_cursor(true) {
+                            return true;
+                        }
+
+                        // Option/Control + Shift + Left:
+                        // сразу расширяем до начала слова.
+                        if word_jump {
+                            screen.move_selection_end_by_word(false);
+                        }
+                    }
+
+                    // Shift + Right:
+                    // начинаем selection с позиции cursor.
+                    NamedKey::ArrowRight => {
+                        if !screen.begin_selection_from_cursor(false) {
+                            return true;
+                        }
+
+                        // Option/Control + Shift + Right:
+                        // сразу расширяем до конца слова.
+                        if word_jump {
+                            screen.move_selection_end_by_word(true);
+                        }
+                    }
+
+                    // Shift + Up:
+                    // начинаем прямо от cursor и идём строкой вверх.
+                    NamedKey::ArrowUp => {
+                        if !screen.begin_selection_at_cursor() {
+                            return true;
+                        }
+
+                        screen.move_selection_end_by_row(false);
+                    }
+
+                    // Shift + Down:
+                    // начинаем прямо от cursor и идём строкой вниз.
+                    NamedKey::ArrowDown => {
+                        if !screen.begin_selection_at_cursor() {
+                            return true;
+                        }
+
+                        screen.move_selection_end_by_row(true);
+                    }
+
+                    _ => unreachable!(),
+                }
+            } else {
+                match key {
+                    NamedKey::ArrowLeft if word_jump => {
+                        screen.move_selection_end_by_word(false);
+                    }
+
+                    NamedKey::ArrowRight if word_jump => {
+                        screen.move_selection_end_by_word(true);
+                    }
+
+                    NamedKey::ArrowLeft => {
+                        screen.move_selection_end_by_cell(false);
+                    }
+
+                    NamedKey::ArrowRight => {
+                        screen.move_selection_end_by_cell(true);
+                    }
+
+                    NamedKey::ArrowUp => {
+                        screen.move_selection_end_by_row(false);
+                    }
+
+                    NamedKey::ArrowDown => {
+                        screen.move_selection_end_by_row(true);
+                    }
+
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        self.request_redraw();
+        true
+    }
+
     fn send_key(&mut self, event_loop: &ActiveEventLoop, event: &winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
         }
         if self.tabs.is_empty() {
             return;
+        }
+
+        if self.handle_selection_key(event) {
+            return;
+        }
+        let plain_arrow = !self.modifiers.shift_key()
+            && !self.modifiers.alt_key()
+            && !self.modifiers.control_key()
+            && !shortcut_modifier(self.modifiers);
+
+        if plain_arrow {
+            if matches!(&event.logical_key, Key::Named(NamedKey::ArrowLeft))
+                && self.collapse_keyboard_selection_to_edge(false)
+            {
+                return;
+            }
+
+            if matches!(&event.logical_key, Key::Named(NamedKey::ArrowRight))
+                && self.collapse_keyboard_selection_to_edge(true)
+            {
+                return;
+            }
         }
         if let Some(chord) = key_chord(event, self.modifiers)
             && let Some(action) = self.keybindings.action(&chord)
@@ -487,12 +876,74 @@ impl Application {
         if shortcut_modifier(self.modifiers) || self.active_tab().focused().shell_exited {
             return;
         }
+        // Selection снимается только при реальном вводе текста
+        // или при нажатии Enter.
+        //
+        // Стрелки, Option, Control, Command и navigation shortcuts
+        // сами по себе selection не снимают.
+        let is_text_input = matches!(&event.logical_key, Key::Character(_))
+            && !self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && !shortcut_modifier(self.modifiers);
+
+        let is_enter = matches!(event.logical_key, Key::Named(NamedKey::Enter));
+
+        if is_text_input {
+            self.active_tab_mut()
+                .focused_mut()
+                .terminal
+                .screen_mut()
+                .mark_input_start_at_cursor();
+        }
+
+        if is_enter {
+            self.active_tab_mut()
+                .focused_mut()
+                .terminal
+                .screen_mut()
+                .clear_input_start();
+        }
+
+        if is_text_input || is_enter {
+            let had_selection = self
+                .active_tab()
+                .focused()
+                .terminal
+                .screen()
+                .selection()
+                .is_some();
+
+            if had_selection {
+                self.active_tab_mut()
+                    .focused_mut()
+                    .terminal
+                    .screen_mut()
+                    .clear_selection();
+
+                self.selecting = None;
+                self.selection_pending = None;
+                self.last_left_click = None;
+
+                self.request_redraw();
+            }
+        }
         let application_cursor = self.active_tab().focused().terminal.application_cursor();
         let bytes = match &event.logical_key {
             Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
             Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
             Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
             Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
+            Key::Named(NamedKey::ArrowLeft)
+                if self.modifiers.alt_key() || self.modifiers.control_key() =>
+            {
+                Some(b"\x1bb".to_vec())
+            }
+
+            Key::Named(NamedKey::ArrowRight)
+                if self.modifiers.alt_key() || self.modifiers.control_key() =>
+            {
+                Some(b"\x1bf".to_vec())
+            }
             Key::Named(NamedKey::ArrowUp) => Some(cursor_sequence(b'A', application_cursor)),
             Key::Named(NamedKey::ArrowDown) => Some(cursor_sequence(b'B', application_cursor)),
             Key::Named(NamedKey::ArrowRight) => Some(cursor_sequence(b'C', application_cursor)),
@@ -547,16 +998,35 @@ impl Application {
         }
         match action {
             Action::NewTab => {
-                self.queue_new_tab(default_working_directory());
+                let directory = self.active_tab().source_directory().to_path_buf();
+                self.queue_new_tab(directory);
             }
             Action::Close => {
-                if !self.close_focused_pane() && !self.close_tab_at(self.active_tab) {
+                if self.close_focused_pane() {
+                    self.pending_pinned_close = None;
+                    self.update_window_title();
+                    return;
+                }
+
+                let index = self.active_tab;
+
+                if !self.confirm_pinned_tab_close(index) {
+                    return;
+                }
+
+                if !self.close_tab_at(index) {
                     self.persist_workspace();
                     event_loop.exit();
                 }
             }
             Action::CloseTab => {
-                if !self.close_tab_at(self.active_tab) {
+                let index = self.active_tab;
+
+                if !self.confirm_pinned_tab_close(index) {
+                    return;
+                }
+
+                if !self.close_tab_at(index) {
                     self.persist_workspace();
                     event_loop.exit();
                 }
@@ -565,13 +1035,24 @@ impl Application {
             Action::PreviousTab => {
                 self.switch_tab((self.active_tab + self.tabs.len() - 1) % self.tabs.len())
             }
+            Action::MoveTabLeft => {
+                self.move_active_tab(-1);
+            }
+            Action::MoveTabRight => {
+                self.move_active_tab(1);
+            }
             Action::RenameTab => {
                 self.rename_input = Some(self.active_tab().title.clone());
                 self.update_window_title();
             }
             Action::DuplicateTab => {
-                let directory = self.active_tab().source_directory().to_path_buf();
-                self.queue_new_tab(directory);
+                self.queue_duplicate_tab();
+            }
+            Action::TogglePinTab => {
+                self.toggle_active_tab_pin();
+            }
+            Action::RestoreTab => {
+                self.queue_restore_closed_tab();
             }
             Action::SplitHorizontal => self.split_focused(SplitAxis::Horizontal),
             Action::SplitVertical => self.split_focused(SplitAxis::Vertical),
@@ -582,6 +1063,10 @@ impl Application {
             Action::FocusRight => self.focus_direction(Direction::Right),
             Action::FocusUp => self.focus_direction(Direction::Up),
             Action::FocusDown => self.focus_direction(Direction::Down),
+            Action::SwapPaneLeft => self.swap_focused_pane(Direction::Left),
+            Action::SwapPaneRight => self.swap_focused_pane(Direction::Right),
+            Action::SwapPaneUp => self.swap_focused_pane(Direction::Up),
+            Action::SwapPaneDown => self.swap_focused_pane(Direction::Down),
             Action::ResizeLeft => self.resize_direction(Direction::Left),
             Action::ResizeRight => self.resize_direction(Direction::Right),
             Action::ResizeUp => self.resize_direction(Direction::Up),
@@ -634,6 +1119,37 @@ impl Application {
             self.active_tab_mut().focused_pane = next;
             self.update_window_title();
             self.persist_workspace();
+            self.request_redraw();
+        }
+    }
+
+    fn swap_focused_pane(&mut self, direction: Direction) {
+        let Some(rect) = self.renderer.as_ref().map(Renderer::content_rect) else {
+            return;
+        };
+
+        let content = Rect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        };
+
+        let (focused, target) = {
+            let tab = self.active_tab();
+            let focused = tab.focused_pane;
+
+            let Some(target) = tab.root.focus_in_direction(focused, direction, content) else {
+                return;
+            };
+
+            (focused, target)
+        };
+
+        if self.active_tab_mut().root.swap_panes(focused, target) {
+            self.resize_active_panes();
+            self.persist_workspace();
+            self.update_window_title();
             self.request_redraw();
         }
     }
@@ -761,64 +1277,477 @@ impl Application {
         }
     }
 
+    fn register_left_click(&mut self, pane: PaneId, position: PhysicalPosition<f64>) -> u8 {
+        let now = Instant::now();
+
+        let count = self
+            .last_left_click
+            .filter(|previous| {
+                if previous.pane != pane
+                    || now.duration_since(previous.when) > Duration::from_millis(400)
+                {
+                    return false;
+                }
+
+                let dx = position.x - previous.position.x;
+                let dy = position.y - previous.position.y;
+
+                dx * dx + dy * dy <= 36.0
+            })
+            .map_or(1, |previous| {
+                if previous.count >= 3 {
+                    1
+                } else {
+                    previous.count + 1
+                }
+            });
+
+        self.last_left_click = Some(MouseClickState {
+            when: now,
+            pane,
+            position,
+            count,
+        });
+
+        count
+    }
+
     fn mouse_button(&mut self, state: ElementState, button: MouseButton) {
         if button != MouseButton::Left {
             return;
         }
+
         if state == ElementState::Released {
             self.selecting = None;
+            self.selection_pending = None;
+
+            self.dragging_tab = None;
+            self.resizing_split = None;
+
+            let layout_changed = self.tab_drag_changed || self.split_resize_changed;
+
+            self.tab_drag_changed = false;
+            self.split_resize_changed = false;
+
+            if layout_changed {
+                self.persist_workspace();
+            }
+
             return;
         }
+
         if self.tabs.is_empty() {
             return;
         }
+
         let Some(renderer) = &self.renderer else {
             return;
         };
+
         if renderer.new_tab_at(self.cursor_position, self.tabs.len()) {
-            self.queue_new_tab(default_working_directory());
+            let directory = self.active_tab().source_directory().to_path_buf();
+            self.queue_new_tab(directory);
             return;
         }
+
         if let Some(index) = renderer.tab_at(self.cursor_position, self.tabs.len()) {
             if renderer.tab_close_at(self.cursor_position, index, self.tabs.len()) {
+                self.dragging_tab = None;
+
+                if !self.confirm_pinned_tab_close(index) {
+                    return;
+                }
+
                 self.close_tab_at(index);
             } else {
                 self.switch_tab(index);
+
+                self.dragging_tab = Some(index);
+                self.tab_drag_changed = false;
             }
+
             return;
         }
+
+        // Нажатие рядом с divider начинает resize panes.
+        if self.active_tab().zoomed_pane.is_none() {
+            let content = renderer.content_rect();
+
+            let content_rect = Rect {
+                x: content.x,
+                y: content.y,
+                width: content.width,
+                height: content.height,
+            };
+
+            let position = self.cursor_position;
+
+            let handle = self.active_tab().root.split_handle_at(
+                position.x as f32,
+                position.y as f32,
+                content_rect,
+                6.0,
+            );
+
+            if let Some(handle) = handle {
+                self.resizing_split = Some(PaneResizeDrag {
+                    handle,
+                    last_position: position,
+                });
+
+                self.split_resize_changed = false;
+                self.dragging_tab = None;
+                self.selecting = None;
+                self.selection_pending = None;
+
+                return;
+            }
+        }
+
         let Some((pane_id, rect)) = self.pane_at(self.cursor_position) else {
             return;
         };
-        self.active_tab_mut().focused_pane = pane_id;
+
+        // Нажатие рядом с divider начинает resize panes.
+        if self.active_tab().zoomed_pane.is_none() {
+            let content = renderer.content_rect();
+
+            let content_rect = Rect {
+                x: content.x,
+                y: content.y,
+                width: content.width,
+                height: content.height,
+            };
+
+            let position = self.cursor_position;
+
+            let handle = self.active_tab().root.split_handle_at(
+                position.x as f32,
+                position.y as f32,
+                content_rect,
+                6.0,
+            );
+
+            if let Some(handle) = handle {
+                self.resizing_split = Some(PaneResizeDrag {
+                    handle,
+                    last_position: position,
+                });
+
+                self.split_resize_changed = false;
+                self.dragging_tab = None;
+                self.selecting = None;
+                self.selection_pending = None;
+
+                return;
+            }
+        }
+
+        let position = self.cursor_position;
+
         let (row, column) = self
             .renderer
             .as_ref()
             .expect("renderer exists")
-            .cell_at_in(viewport(rect), self.cursor_position);
-        let shortcut = shortcut_modifier(self.modifiers);
-        let pane = self.active_tab_mut().focused_mut();
-        let row = row.min(pane.terminal.screen().rows() - 1);
-        let column = column.min(pane.terminal.screen().columns() - 1);
-        if shortcut {
+            .cell_at_in(viewport(rect), position);
+
+        let (row, column, last_row, has_selection) = {
+            let Some(pane) = self.active_tab().panes.get(&pane_id) else {
+                return;
+            };
+
+            let screen = pane.terminal.screen();
+
+            (
+                row.min(screen.rows() - 1),
+                column.min(screen.columns() - 1),
+                last_interactive_row(screen),
+                screen.selection().is_some(),
+            )
+        };
+
+        // Pane всегда можно активировать кликом.
+        self.active_tab_mut().focused_pane = pane_id;
+
+        let Some(last_row) = last_row else {
+            self.active_tab_mut()
+                .focused_mut()
+                .terminal
+                .screen_mut()
+                .clear_selection();
+
+            self.selecting = None;
+            self.selection_pending = None;
+            self.last_left_click = None;
+            self.request_redraw();
+            return;
+        };
+
+        // Ниже последнего prompt/output selection не существует.
+        if row > last_row {
+            if !self.modifiers.shift_key() {
+                self.active_tab_mut()
+                    .focused_mut()
+                    .terminal
+                    .screen_mut()
+                    .clear_selection();
+            }
+
+            self.selecting = None;
+            self.selection_pending = None;
+            self.last_left_click = None;
+
+            self.update_window_title();
+            self.request_redraw();
+            return;
+        }
+
+        if shortcut_modifier(self.modifiers) {
+            self.selection_pending = None;
+            self.last_left_click = None;
+
+            let pane = self.active_tab_mut().focused_mut();
+
             if let Some(uri) = pane.terminal.screen().hyperlink_at(row, column)
                 && let Err(error) = open::that(uri)
             {
                 eprintln!("could not open hyperlink: {error}");
             }
+
             return;
         }
-        pane.terminal.screen_mut().begin_selection(row, column);
-        self.selecting = Some(pane_id);
+
+        // Shift + click изменяет конец существующего selection.
+        if self.modifiers.shift_key() && has_selection {
+            self.active_tab_mut()
+                .focused_mut()
+                .terminal
+                .screen_mut()
+                .extend_selection_to(row.min(last_row), column);
+
+            self.selecting = None;
+            self.selection_pending = None;
+            self.last_left_click = None;
+
+            self.request_redraw();
+            return;
+        }
+
+        let click_count = self.register_left_click(pane_id, position);
+
+        // Triple click = строка.
+        if click_count == 3 {
+            self.active_tab_mut()
+                .focused_mut()
+                .terminal
+                .screen_mut()
+                .select_line_at(row);
+
+            self.selecting = None;
+            self.selection_pending = None;
+            self.last_left_click = None;
+
+            self.request_redraw();
+            return;
+        }
+
+        // Double click = слово.
+        if click_count == 2 {
+            self.active_tab_mut()
+                .focused_mut()
+                .terminal
+                .screen_mut()
+                .select_word_at(row, column);
+
+            self.selecting = None;
+            self.selection_pending = None;
+
+            self.request_redraw();
+            return;
+        }
+
+        // Один click сам по себе ничего не выделяет.
+        self.active_tab_mut()
+            .focused_mut()
+            .terminal
+            .screen_mut()
+            .clear_selection();
+
+        self.selecting = None;
+
+        self.selection_pending = Some(PendingSelection {
+            pane: pane_id,
+            row,
+            column,
+            position,
+            rectangular: self.modifiers.alt_key(),
+        });
+
         self.update_window_title();
         self.request_redraw();
     }
 
     fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_position = position;
+
+        let resize_drag = self
+            .resizing_split
+            .as_ref()
+            .map(|drag| (drag.handle.clone(), drag.last_position));
+
+        if let Some((handle, previous_position)) = resize_drag {
+            let Some(content) = self
+                .renderer
+                .as_ref()
+                .map(|renderer| renderer.content_rect())
+            else {
+                return;
+            };
+
+            let content_rect = Rect {
+                x: content.x,
+                y: content.y,
+                width: content.width,
+                height: content.height,
+            };
+
+            let delta_x = (position.x - previous_position.x) as f32;
+            let delta_y = (position.y - previous_position.y) as f32;
+
+            let changed = self.active_tab_mut().root.resize_split_by_pixels(
+                &handle,
+                content_rect,
+                delta_x,
+                delta_y,
+            );
+
+            if let Some(drag) = &mut self.resizing_split {
+                drag.last_position = position;
+            }
+
+            if changed {
+                self.split_resize_changed = true;
+                self.resize_active_panes();
+                self.request_redraw();
+            }
+
+            return;
+        }
+
+        if let Some(source) = self.dragging_tab {
+            let Some(target) = self
+                .renderer
+                .as_ref()
+                .and_then(|renderer| renderer.tab_at(position, self.tabs.len()))
+            else {
+                return;
+            };
+
+            if source == target {
+                return;
+            }
+
+            if source >= self.tabs.len() || target >= self.tabs.len() {
+                return;
+            }
+
+            // Pinned tabs остаются только внутри pinned-группы.
+            if self.tabs[source].pinned != self.tabs[target].pinned {
+                return;
+            }
+
+            let tab = self.tabs.remove(source);
+            self.tabs.insert(target, tab);
+
+            self.active_tab = target;
+            self.dragging_tab = Some(target);
+            self.tab_drag_changed = true;
+            self.pending_pinned_close = None;
+
+            self.request_redraw();
+            return;
+        }
+
+        // MouseDown уже был, но drag ещё не начался.
+        if self.selecting.is_none()
+            && let Some(pending) = self.selection_pending
+        {
+            let dx = position.x - pending.position.x;
+            let dy = position.y - pending.position.y;
+
+            // Маленькие движения мыши не являются selection.
+            if dx * dx + dy * dy < 16.0 {
+                return;
+            }
+
+            let Some((_, rect)) = self
+                .active_layout()
+                .into_iter()
+                .find(|(pane, _)| *pane == pending.pane)
+            else {
+                self.selection_pending = None;
+                return;
+            };
+
+            let (row, column) = self
+                .renderer
+                .as_ref()
+                .expect("renderer exists")
+                .cell_at_in(viewport(rect), position);
+
+            let (row, column, last_row) = {
+                let Some(pane) = self.active_tab().panes.get(&pending.pane) else {
+                    self.selection_pending = None;
+                    return;
+                };
+
+                let screen = pane.terminal.screen();
+
+                (
+                    row.min(screen.rows() - 1),
+                    column.min(screen.columns() - 1),
+                    last_interactive_row(screen),
+                )
+            };
+
+            let Some(last_row) = last_row else {
+                self.selection_pending = None;
+                return;
+            };
+
+            let row = row.min(last_row);
+
+            let Some(pane) = self.active_tab_mut().panes.get_mut(&pending.pane) else {
+                self.selection_pending = None;
+                return;
+            };
+
+            if pending.rectangular {
+                pane.terminal
+                    .screen_mut()
+                    .begin_rectangular_selection(pending.row, pending.column);
+            } else {
+                pane.terminal
+                    .screen_mut()
+                    .begin_selection(pending.row, pending.column);
+            }
+
+            pane.terminal.screen_mut().update_selection(row, column);
+
+            self.selecting = Some(pending.pane);
+            self.selection_pending = None;
+
+            // Drag не должен потом превратиться в double-click.
+            self.last_left_click = None;
+
+            self.request_redraw();
+            return;
+        }
+
         let Some(selecting) = self.selecting else {
             return;
         };
+
         let Some((_, rect)) = self
             .active_layout()
             .into_iter()
@@ -826,17 +1755,41 @@ impl Application {
         else {
             return;
         };
+
         let (row, column) = self
             .renderer
             .as_ref()
             .expect("renderer exists")
             .cell_at_in(viewport(rect), position);
+
+        let (row, column, last_row) = {
+            let Some(pane) = self.active_tab().panes.get(&selecting) else {
+                return;
+            };
+
+            let screen = pane.terminal.screen();
+
+            (
+                row.min(screen.rows() - 1),
+                column.min(screen.columns() - 1),
+                last_interactive_row(screen),
+            )
+        };
+
+        let Some(last_row) = last_row else {
+            return;
+        };
+
+        // Главное правило:
+        // ниже последнего prompt/output selection никогда не идёт.
+        let row = row.min(last_row);
+
         let Some(pane) = self.active_tab_mut().panes.get_mut(&selecting) else {
             return;
         };
-        let row = row.min(pane.terminal.screen().rows() - 1);
-        let column = column.min(pane.terminal.screen().columns() - 1);
+
         pane.terminal.screen_mut().update_selection(row, column);
+
         self.request_redraw();
     }
 
@@ -886,7 +1839,11 @@ impl Application {
             .iter()
             .enumerate()
             .map(|(index, tab)| TabLabel {
-                title: tab.title.clone(),
+                title: if tab.pinned {
+                    format!("📌 {}", tab.title)
+                } else {
+                    tab.title.clone()
+                },
                 active: index == self.active_tab,
             })
             .collect();
@@ -931,6 +1888,15 @@ impl Application {
         let Some(window) = &self.window else { return };
         if self.tabs.is_empty() {
             window.set_title("Grin — starting shell…");
+            return;
+        }
+        if let Some(index) = self.pending_pinned_close
+            && let Some(tab) = self.tabs.get(index)
+        {
+            window.set_title(&format!(
+                "⚠ Close pinned tab \"{}\"? Close it again to confirm",
+                tab.title
+            ));
             return;
         }
         if let Some(name) = &self.rename_input {
@@ -990,6 +1956,7 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::PtyReady => self.process_pty_events(),
             UserEvent::InitialReady(result) => self.complete_initial_sessions(result),
             UserEvent::PaneSpawned { target, result } => self.complete_pane_spawn(target, result),
+            UserEvent::TabRestored(result) => self.complete_tab_restore(result),
         }
     }
     fn window_event(
@@ -1079,6 +2046,44 @@ fn fresh_initial_session(
     })
 }
 
+fn restore_tab_session(
+    state: TabState,
+    cursor_shape: terminal_core::CursorShape,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<TabSession> {
+    let tree_ids: HashSet<_> = state.root.panes().into_iter().collect();
+    let state_ids: HashSet<_> = state.panes.iter().map(|pane| pane.id).collect();
+
+    if tree_ids != state_ids || !tree_ids.contains(&state.focused_pane) {
+        anyhow::bail!("tab has inconsistent pane identities");
+    }
+
+    let mut panes = HashMap::new();
+
+    for pane in state.panes {
+        let runtime = spawn_runtime(
+            pane.id,
+            80,
+            24,
+            pane.working_directory,
+            cursor_shape,
+            proxy.clone(),
+        )?;
+
+        panes.insert(pane.id, runtime);
+    }
+
+    Ok(TabSession {
+        title: state.title,
+        pinned: state.pinned,
+        root: state.root,
+        focused_pane: state.focused_pane,
+        zoomed_pane: state.zoomed_pane,
+        panes,
+        custom_title: true,
+    })
+}
+
 fn restore_initial_sessions(
     workspace: Workspace,
     cursor_shape: terminal_core::CursorShape,
@@ -1091,33 +2096,25 @@ fn restore_initial_sessions(
     let mut restored_tabs = Vec::new();
     let mut maximum_id = 0;
     for state in workspace.tabs {
-        let tree_ids: HashSet<_> = state.root.panes().into_iter().collect();
-        let state_ids: HashSet<_> = state.panes.iter().map(|pane| pane.id).collect();
-        if tree_ids != state_ids || !tree_ids.contains(&state.focused_pane) {
-            anyhow::bail!("workspace tab has inconsistent pane identities");
-        }
-        let mut panes = HashMap::new();
-        for pane in state.panes {
+        for pane in &state.panes {
             maximum_id = maximum_id.max(pane.id.0);
-            let runtime = spawn_runtime(
-                pane.id,
-                80,
-                24,
-                pane.working_directory,
-                cursor_shape,
-                proxy.clone(),
-            )?;
-            panes.insert(pane.id, runtime);
         }
-        restored_tabs.push(TabSession {
-            title: state.title,
-            root: state.root,
-            focused_pane: state.focused_pane,
-            zoomed_pane: state.zoomed_pane,
-            panes,
-            custom_title: true,
-        });
+
+        restored_tabs.push(restore_tab_session(state, cursor_shape, proxy.clone())?);
     }
+
+    let active_pane = restored_tabs.get(active_tab).map(|tab| tab.focused_pane);
+
+    restored_tabs.sort_by_key(|tab| !tab.pinned);
+
+    let active_tab = active_pane
+        .and_then(|pane| {
+            restored_tabs
+                .iter()
+                .position(|tab| tab.focused_pane == pane)
+        })
+        .unwrap_or(0);
+
     Ok(InitialSessions {
         tabs: restored_tabs,
         active_tab,
@@ -1145,6 +2142,26 @@ fn spawn_runtime(
             let _ = wake_proxy.send_event(UserEvent::PtyReady);
         },
     )
+}
+
+fn last_interactive_row(screen: &terminal_core::Screen) -> Option<usize> {
+    let last_content_row = (0..screen.rows()).rev().find(|&row| {
+        screen
+            .display_line(row)
+            .is_some_and(|line| line.iter().any(|cell| !cell.is_blank()))
+    });
+
+    let cursor_row = screen
+        .display_cursor()
+        .filter(|cursor| cursor.visible)
+        .map(|cursor| cursor.row);
+
+    match (last_content_row, cursor_row) {
+        (Some(content), Some(cursor)) => Some(content.max(cursor)),
+        (Some(content), None) => Some(content),
+        (None, Some(cursor)) => Some(cursor),
+        (None, None) => None,
+    }
 }
 
 fn viewport(rect: Rect) -> ViewportRect {

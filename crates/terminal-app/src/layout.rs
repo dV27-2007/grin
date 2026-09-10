@@ -51,6 +51,11 @@ pub enum Direction {
     Down,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitHandle {
+    path: Vec<bool>,
+}
+
 impl PaneTree {
     pub fn leaf(pane: PaneId) -> Self {
         Self::Leaf { pane }
@@ -137,6 +142,184 @@ impl PaneTree {
         }
     }
 
+    pub fn split_handle_at(
+        &self,
+        x: f32,
+        y: f32,
+        rect: Rect,
+        threshold: f32,
+    ) -> Option<SplitHandle> {
+        self.find_split_handle_at(x, y, rect, threshold)
+            .map(|path| SplitHandle { path })
+    }
+
+    fn find_split_handle_at(
+        &self,
+        x: f32,
+        y: f32,
+        rect: Rect,
+        threshold: f32,
+    ) -> Option<Vec<bool>> {
+        let Self::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return None;
+        };
+
+        let ratio = ratio.clamp(0.1, 0.9);
+
+        let (first_rect, second_rect) = match axis {
+            SplitAxis::Vertical => {
+                let first_width = rect.width * ratio;
+
+                (
+                    Rect {
+                        width: first_width,
+                        ..rect
+                    },
+                    Rect {
+                        x: rect.x + first_width,
+                        width: rect.width - first_width,
+                        ..rect
+                    },
+                )
+            }
+
+            SplitAxis::Horizontal => {
+                let first_height = rect.height * ratio;
+
+                (
+                    Rect {
+                        height: first_height,
+                        ..rect
+                    },
+                    Rect {
+                        y: rect.y + first_height,
+                        height: rect.height - first_height,
+                        ..rect
+                    },
+                )
+            }
+        };
+
+        if first_rect.contains(x, y) {
+            if let Some(mut path) = first.find_split_handle_at(x, y, first_rect, threshold) {
+                path.insert(0, false);
+                return Some(path);
+            }
+        }
+
+        if second_rect.contains(x, y) {
+            if let Some(mut path) = second.find_split_handle_at(x, y, second_rect, threshold) {
+                path.insert(0, true);
+                return Some(path);
+            }
+        }
+
+        let on_divider = match axis {
+            SplitAxis::Vertical => {
+                let divider = rect.x + rect.width * ratio;
+
+                (x - divider).abs() <= threshold && y >= rect.y && y < rect.y + rect.height
+            }
+
+            SplitAxis::Horizontal => {
+                let divider = rect.y + rect.height * ratio;
+
+                (y - divider).abs() <= threshold && x >= rect.x && x < rect.x + rect.width
+            }
+        };
+
+        on_divider.then(Vec::new)
+    }
+
+    pub fn resize_split_by_pixels(
+        &mut self,
+        handle: &SplitHandle,
+        rect: Rect,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> bool {
+        self.resize_split_path(&handle.path, rect, delta_x, delta_y)
+    }
+
+    fn resize_split_path(&mut self, path: &[bool], rect: Rect, delta_x: f32, delta_y: f32) -> bool {
+        let Self::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+
+        if path.is_empty() {
+            let delta = match axis {
+                SplitAxis::Vertical if rect.width > 0.0 => delta_x / rect.width,
+
+                SplitAxis::Horizontal if rect.height > 0.0 => delta_y / rect.height,
+
+                _ => 0.0,
+            };
+
+            if delta == 0.0 {
+                return false;
+            }
+
+            let old_ratio = *ratio;
+            *ratio = (*ratio + delta).clamp(0.1, 0.9);
+
+            return (*ratio - old_ratio).abs() > f32::EPSILON;
+        }
+
+        let ratio_value = ratio.clamp(0.1, 0.9);
+
+        let (first_rect, second_rect) = match axis {
+            SplitAxis::Vertical => {
+                let first_width = rect.width * ratio_value;
+
+                (
+                    Rect {
+                        width: first_width,
+                        ..rect
+                    },
+                    Rect {
+                        x: rect.x + first_width,
+                        width: rect.width - first_width,
+                        ..rect
+                    },
+                )
+            }
+
+            SplitAxis::Horizontal => {
+                let first_height = rect.height * ratio_value;
+
+                (
+                    Rect {
+                        height: first_height,
+                        ..rect
+                    },
+                    Rect {
+                        y: rect.y + first_height,
+                        height: rect.height - first_height,
+                        ..rect
+                    },
+                )
+            }
+        };
+
+        if path[0] {
+            second.resize_split_path(&path[1..], second_rect, delta_x, delta_y)
+        } else {
+            first.resize_split_path(&path[1..], first_rect, delta_x, delta_y)
+        }
+    }
+
     fn layout_into(&self, rect: Rect, output: &mut Vec<(PaneId, Rect)>) {
         match self {
             Self::Leaf { pane } => output.push((*pane, rect)),
@@ -214,6 +397,35 @@ impl PaneTree {
             .map(|(pane, _)| pane)
     }
 
+    pub fn swap_panes(&mut self, first: PaneId, second: PaneId) -> bool {
+        if first == second || !self.contains(first) || !self.contains(second) {
+            return false;
+        }
+
+        self.swap_pane_ids(first, second);
+        true
+    }
+
+    fn swap_pane_ids(&mut self, first: PaneId, second: PaneId) {
+        match self {
+            Self::Leaf { pane } => {
+                if *pane == first {
+                    *pane = second;
+                } else if *pane == second {
+                    *pane = first;
+                }
+            }
+            Self::Split {
+                first: left,
+                second: right,
+                ..
+            } => {
+                left.swap_pane_ids(first, second);
+                right.swap_pane_ids(first, second);
+            }
+        }
+    }
+
     pub fn resize_toward(&mut self, target: PaneId, direction: Direction, amount: f32) -> bool {
         self.resize_inner(target, direction, amount).is_some()
     }
@@ -267,6 +479,37 @@ mod tests {
             height: 100.0,
             ..Rect::default()
         }
+    }
+    #[test]
+    fn swaps_panes_without_changing_tree_shape() {
+        let mut tree = PaneTree::leaf(PaneId(1));
+        tree.split(PaneId(1), PaneId(2), SplitAxis::Vertical);
+        tree.split(PaneId(2), PaneId(3), SplitAxis::Horizontal);
+
+        assert_eq!(tree.panes(), vec![PaneId(1), PaneId(2), PaneId(3)]);
+
+        assert!(tree.swap_panes(PaneId(1), PaneId(3)));
+
+        assert_eq!(tree.panes(), vec![PaneId(3), PaneId(2), PaneId(1)]);
+
+        assert!(!tree.swap_panes(PaneId(1), PaneId(99)));
+    }
+
+    #[test]
+    fn divider_can_be_hit_and_resized_with_pixels() {
+        let mut tree = PaneTree::leaf(PaneId(1));
+        tree.split(PaneId(1), PaneId(2), SplitAxis::Vertical);
+
+        let rect = full_rect();
+
+        let handle = tree
+            .split_handle_at(50.0, 50.0, rect, 5.0)
+            .expect("divider should be detected");
+
+        assert!(tree.resize_split_by_pixels(&handle, rect, 10.0, 0.0,));
+
+        let layout = tree.layout(rect);
+        assert!((layout[0].1.width - 60.0).abs() < 0.01);
     }
 
     #[test]

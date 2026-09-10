@@ -53,6 +53,8 @@ pub struct GridPoint {
 pub struct Selection {
     pub start: GridPoint,
     pub end: GridPoint,
+    pub rectangular: bool,
+    pub keyboard_anchor: Option<GridPoint>,
 }
 
 impl Selection {
@@ -89,6 +91,7 @@ pub struct Screen {
     allow_scrollback: bool,
     viewport_offset: usize,
     selection: Option<Selection>,
+    input_start: Option<GridPoint>,
     search_match: Option<SearchMatch>,
     active_hyperlink: Option<Arc<str>>,
     wrap_pending: bool,
@@ -118,6 +121,7 @@ impl Screen {
             allow_scrollback,
             viewport_offset: 0,
             selection: None,
+            input_start: None,
             search_match: None,
             active_hyperlink: None,
             wrap_pending: false,
@@ -174,19 +178,62 @@ impl Screen {
     }
 
     pub fn display_cursor(&self) -> Option<Cursor> {
-        (self.viewport_offset == 0).then_some(self.cursor)
+        if self.viewport_offset != 0 {
+            return None;
+        }
+
+        let mut cursor = self.cursor;
+
+        let Some(selection) = self.selection else {
+            return Some(cursor);
+        };
+
+        let Some(anchor) = selection.keyboard_anchor else {
+            return Some(cursor);
+        };
+
+        let mut point = selection.end;
+
+        // При selection вправо caret находится ПОСЛЕ выбранного символа.
+        // При selection влево caret находится ПЕРЕД выбранной областью.
+        if point >= anchor {
+            point = self.point_after(point);
+        }
+
+        let top = self.display_top();
+
+        if point.line >= top && point.line < top + self.rows {
+            cursor.row = point.line - top;
+            cursor.column = point.column.min(self.columns - 1);
+        }
+
+        Some(cursor)
     }
 
     pub fn selected_at(&self, row: usize, column: usize) -> bool {
         let Some(selection) = self.selection else {
             return false;
         };
+
         let point = GridPoint {
             line: self.display_top() + row,
             column,
         };
-        let (start, end) = selection.ordered();
-        point >= start && point <= end
+
+        if selection.rectangular {
+            let top = selection.start.line.min(selection.end.line);
+            let bottom = selection.start.line.max(selection.end.line);
+            let left = selection.start.column.min(selection.end.column);
+            let right = selection.start.column.max(selection.end.column);
+
+            point.line >= top
+                && point.line <= bottom
+                && point.column >= left
+                && point.column <= right
+        } else {
+            let (start, end) = selection.ordered();
+            point >= start && point <= end
+        }
     }
 
     pub fn search_match_at(&self, row: usize, column: usize) -> bool {
@@ -267,21 +314,357 @@ impl Screen {
         }
     }
 
+    pub fn mark_input_start_at_cursor(&mut self) {
+        if self.input_start.is_some() || self.viewport_offset != 0 {
+            return;
+        }
+
+        self.input_start = Some(self.display_point(self.cursor.row, self.cursor.column));
+    }
+
+    pub fn clear_input_start(&mut self) {
+        self.input_start = None;
+    }
+
     pub fn begin_selection(&mut self, row: usize, column: usize) {
         let point = self.display_point(row, column);
+
         self.selection = Some(Selection {
             start: point,
             end: point,
+            rectangular: false,
+            keyboard_anchor: None,
         });
+
+        self.mark_changed();
+    }
+
+    pub fn begin_rectangular_selection(&mut self, row: usize, column: usize) {
+        let point = self.display_point(row, column);
+
+        self.selection = Some(Selection {
+            start: point,
+            end: point,
+            rectangular: true,
+            keyboard_anchor: None,
+        });
+
         self.mark_changed();
     }
 
     pub fn update_selection(&mut self, row: usize, column: usize) {
         let point = self.display_point(row, column);
+
         if let Some(selection) = &mut self.selection {
             selection.end = point;
             self.mark_changed();
         }
+    }
+
+    pub fn extend_selection_to(&mut self, row: usize, column: usize) -> bool {
+        if self.selection.is_none() {
+            return false;
+        }
+
+        let point = self.display_point(row, column);
+
+        self.selection.as_mut().expect("selection exists").end = point;
+        self.mark_changed();
+
+        true
+    }
+
+    pub fn select_word_at(&mut self, row: usize, column: usize) -> bool {
+        let point = self.display_point(row, column);
+
+        let Some(line) = self.logical_line(point.line) else {
+            return false;
+        };
+
+        let column = point.column.min(line.len() - 1);
+        let class = selection_class_at(line, column);
+
+        if class == SelectionClass::Blank {
+            self.clear_selection();
+            return false;
+        }
+
+        let mut start = column;
+        while start > 0 && selection_class_at(line, start - 1) == class {
+            start -= 1;
+        }
+
+        let mut end = column;
+        while end + 1 < line.len() && selection_class_at(line, end + 1) == class {
+            end += 1;
+        }
+
+        self.selection = Some(Selection {
+            start: GridPoint {
+                line: point.line,
+                column: start,
+            },
+            end: GridPoint {
+                line: point.line,
+                column: end,
+            },
+            rectangular: false,
+            keyboard_anchor: None,
+        });
+
+        self.mark_changed();
+        true
+    }
+
+    pub fn select_line_at(&mut self, row: usize) -> bool {
+        let point = self.display_point(row, 0);
+
+        let Some(line) = self.logical_line(point.line) else {
+            return false;
+        };
+
+        let end = last_nonblank_column(line).unwrap_or(0);
+
+        self.selection = Some(Selection {
+            start: GridPoint {
+                line: point.line,
+                column: 0,
+            },
+            end: GridPoint {
+                line: point.line,
+                column: end,
+            },
+            rectangular: false,
+            keyboard_anchor: None,
+        });
+
+        self.mark_changed();
+        true
+    }
+
+    pub fn begin_selection_from_cursor(&mut self, backward: bool) -> bool {
+        let Some(cursor) = self.display_cursor().filter(|cursor| cursor.visible) else {
+            return false;
+        };
+
+        let cursor_point = self.display_point(cursor.row, cursor.column);
+
+        let point = if backward {
+            let mut previous = self.step_selection_point(cursor_point, false);
+
+            // Не даём keyboard selection заходить левее начала
+            // текущей вводимой команды.
+            if let Some(input_start) = self.input_start {
+                previous = previous.max(input_start);
+            }
+
+            if previous == cursor_point {
+                return false;
+            }
+
+            previous
+        } else {
+            let last = self.last_selectable_point();
+
+            if cursor_point > last {
+                return false;
+            }
+
+            cursor_point
+        };
+
+        self.selection = Some(Selection {
+            start: point,
+            end: point,
+            rectangular: false,
+            keyboard_anchor: Some(cursor_point),
+        });
+
+        self.mark_changed();
+        true
+    }
+
+    pub fn begin_selection_at_cursor(&mut self) -> bool {
+        let Some(cursor) = self.display_cursor().filter(|cursor| cursor.visible) else {
+            return false;
+        };
+
+        let point = self.display_point(cursor.row, cursor.column);
+
+        self.selection = Some(Selection {
+            start: point,
+            end: point,
+            rectangular: false,
+            keyboard_anchor: Some(point),
+        });
+
+        self.mark_changed();
+        true
+    }
+
+    pub fn move_selection_end_by_cell(&mut self, forward: bool) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+
+        let current = selection.end;
+        let mut next = self.step_selection_point(current, forward);
+
+        if selection.keyboard_anchor.is_some() && !forward {
+            if let Some(input_start) = self.input_start {
+                next = next.max(input_start);
+            }
+        }
+
+        if next == current {
+            return false;
+        }
+
+        self.selection.as_mut().expect("selection exists").end = next;
+        self.mark_changed();
+
+        true
+    }
+
+    pub fn move_selection_end_by_row(&mut self, down: bool) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+
+        let first = self.display_point(0, 0);
+        let last = self.last_selectable_point();
+
+        let mut next = selection.end;
+
+        if down {
+            if next.line >= last.line {
+                return false;
+            }
+
+            next.line += 1;
+
+            if next.line == last.line {
+                next.column = next.column.min(last.column);
+                if selection.keyboard_anchor.is_some() {
+                    if let Some(input_start) = self.input_start {
+                        if next < input_start {
+                            next = input_start;
+                        }
+                    }
+                }
+            }
+        } else {
+            if next.line <= first.line {
+                return false;
+            }
+
+            next.line -= 1;
+        }
+
+        next.column = next.column.min(self.columns - 1);
+
+        self.selection.as_mut().expect("selection exists").end = next;
+        self.mark_changed();
+
+        true
+    }
+
+    pub fn move_selection_end_by_word(&mut self, forward: bool) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+
+        let original = selection.end;
+        let mut point = self.step_selection_point(original, forward);
+
+        if selection.keyboard_anchor.is_some() && !forward {
+            if let Some(input_start) = self.input_start {
+                point = point.max(input_start);
+            }
+        }
+
+        if point == original {
+            return false;
+        }
+
+        if forward {
+            while self.selection_class_at_point(point) != SelectionClass::Word {
+                let next = self.step_selection_point(point, true);
+
+                if next == point {
+                    break;
+                }
+
+                point = next;
+            }
+
+            while self.selection_class_at_point(point) == SelectionClass::Word {
+                let next = self.step_selection_point(point, true);
+
+                if next == point || self.selection_class_at_point(next) != SelectionClass::Word {
+                    break;
+                }
+
+                point = next;
+            }
+        } else {
+            while self.selection_class_at_point(point) != SelectionClass::Word {
+                let next = self.step_selection_point(point, false);
+
+                if next == point {
+                    break;
+                }
+
+                point = next;
+            }
+
+            while self.selection_class_at_point(point) == SelectionClass::Word {
+                let next = self.step_selection_point(point, false);
+
+                if next == point || self.selection_class_at_point(next) != SelectionClass::Word {
+                    break;
+                }
+
+                point = next;
+            }
+        }
+
+        if point == original {
+            return false;
+        }
+
+        self.selection.as_mut().expect("selection exists").end = point;
+        self.mark_changed();
+
+        true
+    }
+
+    pub fn collapse_keyboard_selection(&mut self, toward_right: bool) -> Option<isize> {
+        let selection = self.selection?;
+
+        selection.keyboard_anchor?;
+
+        let (start, end) = selection.ordered();
+
+        let target = if toward_right {
+            self.point_after(end)
+        } else {
+            start
+        };
+
+        let current = self.display_point(self.cursor.row, self.cursor.column);
+
+        let current_index = current.line as i128 * self.columns as i128 + current.column as i128;
+
+        let target_index = target.line as i128 * self.columns as i128 + target.column as i128;
+
+        let delta =
+            (target_index - current_index).clamp(isize::MIN as i128, isize::MAX as i128) as isize;
+
+        self.selection = None;
+        self.mark_changed();
+
+        Some(delta)
     }
 
     pub fn clear_selection(&mut self) {
@@ -291,33 +674,77 @@ impl Screen {
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        let (start, end) = self.selection?.ordered();
+        let selection = self.selection?;
+
+        if selection.rectangular {
+            let top = selection.start.line.min(selection.end.line);
+            let bottom = selection.start.line.max(selection.end.line);
+            let left = selection.start.column.min(selection.end.column);
+            let right = selection.start.column.max(selection.end.column);
+
+            let mut output = String::new();
+
+            for line_index in top..=bottom {
+                let Some(line) = self.logical_line(line_index) else {
+                    continue;
+                };
+
+                let from = left.min(line.len() - 1);
+                let to = right.min(line.len() - 1);
+
+                let mut text = String::new();
+
+                for cell in &line[from..=to] {
+                    if cell.width != CellWidth::Continuation {
+                        text.push_str(&cell.text);
+                    }
+                }
+
+                output.push_str(text.trim_end_matches(' '));
+
+                if line_index != bottom {
+                    output.push('\n');
+                }
+            }
+
+            return Some(output);
+        }
+
+        let (start, end) = selection.ordered();
         let mut output = String::new();
+
         for line_index in start.line..=end.line {
             let Some(line) = self.logical_line(line_index) else {
                 continue;
             };
+
             let from = if line_index == start.line {
                 start.column
             } else {
                 0
             };
+
             let to = if line_index == end.line {
                 end.column
             } else {
                 self.columns - 1
             };
+
             let mut text = String::new();
+
             for cell in &line[from.min(line.len() - 1)..=to.min(line.len() - 1)] {
                 if cell.width != CellWidth::Continuation {
                     text.push_str(&cell.text);
                 }
             }
+
             output.push_str(text.trim_end_matches(' '));
+
             if line_index != end.line {
                 output.push('\n');
             }
         }
+
         Some(output)
     }
 
@@ -743,6 +1170,94 @@ impl Screen {
         }
     }
 
+    fn last_selectable_point(&self) -> GridPoint {
+        let mut last_row = (0..self.rows).rev().find(|&row| {
+            self.display_line(row)
+                .is_some_and(|line| line.iter().any(|cell| !cell.is_blank()))
+        });
+
+        if self.viewport_offset == 0 && self.cursor.visible {
+            last_row = Some(last_row.map_or(self.cursor.row, |row| row.max(self.cursor.row)));
+        }
+
+        let row = last_row.unwrap_or(0);
+
+        let mut column = self
+            .display_line(row)
+            .and_then(last_nonblank_column)
+            .unwrap_or(0);
+
+        if self.viewport_offset == 0 && self.cursor.visible && self.cursor.row == row {
+            column = column.max(self.cursor.column);
+        }
+
+        self.display_point(row, column)
+    }
+
+    fn point_after(&self, point: GridPoint) -> GridPoint {
+        if point.column + 1 < self.columns {
+            GridPoint {
+                line: point.line,
+                column: point.column + 1,
+            }
+        } else if point.line + 1 < self.logical_line_count() {
+            GridPoint {
+                line: point.line + 1,
+                column: 0,
+            }
+        } else {
+            point
+        }
+    }
+
+    fn step_selection_point(&self, point: GridPoint, forward: bool) -> GridPoint {
+        let first = self.display_point(0, 0);
+        let last = self.last_selectable_point();
+
+        if forward {
+            if point >= last {
+                return point;
+            }
+
+            let candidate = if point.column + 1 < self.columns {
+                GridPoint {
+                    line: point.line,
+                    column: point.column + 1,
+                }
+            } else {
+                GridPoint {
+                    line: point.line + 1,
+                    column: 0,
+                }
+            };
+
+            candidate.min(last)
+        } else {
+            if point <= first {
+                return point;
+            }
+
+            if point.column > 0 {
+                GridPoint {
+                    line: point.line,
+                    column: point.column - 1,
+                }
+            } else {
+                GridPoint {
+                    line: point.line - 1,
+                    column: self.columns - 1,
+                }
+            }
+            .max(first)
+        }
+    }
+
+    fn selection_class_at_point(&self, point: GridPoint) -> SelectionClass {
+        self.logical_line(point.line)
+            .map(|line| selection_class_at(line, point.column))
+            .unwrap_or(SelectionClass::Blank)
+    }
+
     fn reveal_line(&mut self, line: usize) {
         let history = self.scrollback.len();
         self.viewport_offset = if line < history { history - line } else { 0 };
@@ -766,6 +1281,41 @@ impl Screen {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionClass {
+    Blank,
+    Word,
+    Other,
+}
+
+fn selection_class_at(line: &[Cell], column: usize) -> SelectionClass {
+    let column = column.min(line.len() - 1);
+
+    let cell = if line[column].width == CellWidth::Continuation && column > 0 {
+        &line[column - 1]
+    } else {
+        &line[column]
+    };
+
+    if cell.is_blank() {
+        return SelectionClass::Blank;
+    }
+
+    let is_word = cell.text.chars().all(|character| {
+        character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | ':' | '@' | '~')
+    });
+
+    if is_word {
+        SelectionClass::Word
+    } else {
+        SelectionClass::Other
+    }
+}
+
+fn last_nonblank_column(line: &[Cell]) -> Option<usize> {
+    line.iter().rposition(|cell| !cell.is_blank())
 }
 
 fn blank_line(columns: usize, attributes: Attributes) -> Line {

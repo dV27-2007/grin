@@ -153,6 +153,7 @@ fn directory_from_osc7(uri: &str) -> Option<PathBuf> {
 
 pub struct TabSession {
     pub title: String,
+    pub pinned: bool,
     pub root: PaneTree,
     pub focused_pane: PaneId,
     pub zoomed_pane: Option<PaneId>,
@@ -165,6 +166,7 @@ impl TabSession {
         let id = pane.id;
         Self {
             title,
+            pinned: false,
             root: PaneTree::leaf(id),
             focused_pane: id,
             zoomed_pane: None,
@@ -185,6 +187,7 @@ impl TabSession {
         panes.sort_by_key(|pane| pane.id.0);
         TabState {
             title: self.title.clone(),
+            pinned: self.pinned,
             root: self.root.clone(),
             focused_pane: self.focused_pane,
             zoomed_pane: self.zoomed_pane,
