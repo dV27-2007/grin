@@ -897,17 +897,19 @@ impl Renderer {
             self.options.opacity,
             self.size,
         );
-        if pane.focused {
-            let border = (PANE_BORDER_WIDTH * self.scale_factor) as f32;
-            for rect in border_rectangles(pane.rect, border) {
-                push_rect(
-                    &mut self.rect_scratch,
-                    rect,
-                    theme.pane_border,
-                    self.options.opacity,
-                    self.size,
-                );
-            }
+
+        // Тонкая граница присутствует у каждого pane.
+        // Поэтому соседние panes визуально всегда разделены.
+        let border = (PANE_BORDER_WIDTH * self.scale_factor).max(1.0) as f32;
+
+        for rect in border_rectangles(pane.rect, border) {
+            push_rect(
+                &mut self.rect_scratch,
+                rect,
+                theme.pane_border,
+                self.options.opacity,
+                self.size,
+            );
         }
 
         let width = self.size.width as f32;

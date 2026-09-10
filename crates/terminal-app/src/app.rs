@@ -14,7 +14,7 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
-    window::{Window, WindowId},
+    window::{CursorIcon, Window, WindowId},
 };
 
 use crate::{
@@ -1587,8 +1587,84 @@ impl Application {
         self.request_redraw();
     }
 
+    fn update_mouse_cursor(&self, position: PhysicalPosition<f64>) {
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        if self.tabs.is_empty() {
+            window.set_cursor(CursorIcon::Default);
+            return;
+        }
+
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+
+        // Drag tab.
+        if self.dragging_tab.is_some() {
+            window.set_cursor(CursorIcon::Grabbing);
+            return;
+        }
+
+        // Active pane resize.
+        if let Some(drag) = &self.resizing_split {
+            let icon = match drag.handle.axis() {
+                SplitAxis::Vertical => CursorIcon::ColResize,
+                SplitAxis::Horizontal => CursorIcon::RowResize,
+            };
+
+            window.set_cursor(icon);
+            return;
+        }
+
+        // Tabs / close / plus.
+        if renderer.new_tab_at(position, self.tabs.len())
+            || renderer.tab_at(position, self.tabs.len()).is_some()
+        {
+            window.set_cursor(CursorIcon::Pointer);
+            return;
+        }
+
+        // Hover over pane divider.
+        if self.active_tab().zoomed_pane.is_none() {
+            let content = renderer.content_rect();
+
+            let rect = Rect {
+                x: content.x,
+                y: content.y,
+                width: content.width,
+                height: content.height,
+            };
+
+            if let Some(handle) = self.active_tab().root.split_handle_at(
+                position.x as f32,
+                position.y as f32,
+                rect,
+                6.0,
+            ) {
+                let icon = match handle.axis() {
+                    SplitAxis::Vertical => CursorIcon::ColResize,
+                    SplitAxis::Horizontal => CursorIcon::RowResize,
+                };
+
+                window.set_cursor(icon);
+                return;
+            }
+        }
+
+        // Terminal body.
+        if self.pane_at(position).is_some() {
+            window.set_cursor(CursorIcon::Text);
+            return;
+        }
+
+        window.set_cursor(CursorIcon::Default);
+    }
+
     fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_position = position;
+        self.update_mouse_cursor(position);
 
         let resize_drag = self
             .resizing_split

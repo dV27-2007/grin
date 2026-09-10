@@ -54,6 +54,13 @@ pub enum Direction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitHandle {
     path: Vec<bool>,
+    axis: SplitAxis,
+}
+
+impl SplitHandle {
+    pub fn axis(&self) -> SplitAxis {
+        self.axis
+    }
 }
 
 impl PaneTree {
@@ -150,7 +157,7 @@ impl PaneTree {
         threshold: f32,
     ) -> Option<SplitHandle> {
         self.find_split_handle_at(x, y, rect, threshold)
-            .map(|path| SplitHandle { path })
+            .map(|(path, axis)| SplitHandle { path, axis })
     }
 
     fn find_split_handle_at(
@@ -159,7 +166,7 @@ impl PaneTree {
         y: f32,
         rect: Rect,
         threshold: f32,
-    ) -> Option<Vec<bool>> {
+    ) -> Option<(Vec<bool>, SplitAxis)> {
         let Self::Split {
             axis,
             ratio,
@@ -207,16 +214,20 @@ impl PaneTree {
         };
 
         if first_rect.contains(x, y) {
-            if let Some(mut path) = first.find_split_handle_at(x, y, first_rect, threshold) {
+            if let Some((mut path, found_axis)) =
+                first.find_split_handle_at(x, y, first_rect, threshold)
+            {
                 path.insert(0, false);
-                return Some(path);
+                return Some((path, found_axis));
             }
         }
 
         if second_rect.contains(x, y) {
-            if let Some(mut path) = second.find_split_handle_at(x, y, second_rect, threshold) {
+            if let Some((mut path, found_axis)) =
+                second.find_split_handle_at(x, y, second_rect, threshold)
+            {
                 path.insert(0, true);
-                return Some(path);
+                return Some((path, found_axis));
             }
         }
 
@@ -234,7 +245,7 @@ impl PaneTree {
             }
         };
 
-        on_divider.then(Vec::new)
+        on_divider.then(|| (Vec::new(), *axis))
     }
 
     pub fn resize_split_by_pixels(
