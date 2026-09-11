@@ -1,13 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use arboard::Clipboard;
-use terminal_renderer::{PaneView, RenderOptions, RenderTheme, Renderer, TabLabel, ViewportRect};
+use terminal_renderer::{
+    CommandPaletteRow, CommandPaletteView, HoverTarget, PaletteLayout, PaneView, RenderOptions,
+    RenderTheme, Renderer, TabLabel, ViewportRect,
+};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
@@ -21,26 +25,36 @@ use crate::{
     action::{Action, KeyBindings, KeyChord},
     config::{AppConfig, ThemePalette, workspace_path},
     layout::{Direction, PaneId, Rect, SplitAxis, SplitHandle},
+    palette::CommandPaletteState,
     session::{TabSession, TerminalPane},
-    workspace::{TabState, WORKSPACE_VERSION, Workspace},
+    workspace::{TabState, WORKSPACE_VERSION, WindowState, Workspace},
 };
 
-enum UserEvent {
+pub(crate) enum UserEvent {
     PtyReady,
-    InitialReady(Result<InitialSessions, String>),
+    InitialReady {
+        window_id: WindowId,
+        result: Result<InitialSessions, String>,
+    },
     PaneSpawned {
+        window_id: WindowId,
         target: SpawnTarget,
         result: Result<TerminalPane, String>,
     },
-    TabRestored(Result<TabSession, String>),
+    TabRestored {
+        window_id: WindowId,
+        result: Result<TabSession, String>,
+    },
+    #[cfg(target_os = "macos")]
+    MenuAction(Action),
 }
 
-enum SpawnTarget {
+pub(crate) enum SpawnTarget {
     NewTab { title: Option<String> },
     Split { source: PaneId, axis: SplitAxis },
 }
 
-struct InitialSessions {
+pub(crate) struct InitialSessions {
     tabs: Vec<TabSession>,
     active_tab: usize,
     next_pane_id: u64,
@@ -64,33 +78,51 @@ struct MouseClickState {
     count: u8,
 }
 
+#[derive(Clone, Copy)]
+struct TabDragState {
+    source: usize,
+    target: usize,
+    grab_offset_x: f64,
+    position: PhysicalPosition<f64>,
+}
+
 struct PaneResizeDrag {
     handle: SplitHandle,
     last_position: PhysicalPosition<f64>,
 }
 
-pub struct Application {
-    started_at: Instant,
-    proxy: EventLoopProxy<UserEvent>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseTarget {
+    Pane,
+    Tab,
+    Window,
+    Application,
+}
+
+fn close_target(panes: usize, tabs: usize, other_windows: usize) -> CloseTarget {
+    if panes > 1 {
+        CloseTarget::Pane
+    } else if tabs > 1 {
+        CloseTarget::Tab
+    } else if other_windows > 0 {
+        CloseTarget::Window
+    } else {
+        CloseTarget::Application
+    }
+}
+
+struct WindowSession {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     tabs: Vec<TabSession>,
-    closed_tabs: Vec<TabState>,
     active_tab: usize,
-    next_pane_id: u64,
-    startup_workspace: Option<Workspace>,
-    workspace_path: PathBuf,
-    config: AppConfig,
-    keybindings: KeyBindings,
-    theme_name: String,
-    clipboard: Option<Clipboard>,
     modifiers: ModifiersState,
     cursor_position: PhysicalPosition<f64>,
     selecting: Option<PaneId>,
     selection_pending: Option<PendingSelection>,
     last_left_click: Option<MouseClickState>,
 
-    dragging_tab: Option<usize>,
+    dragging_tab: Option<TabDragState>,
     tab_drag_changed: bool,
 
     resizing_split: Option<PaneResizeDrag>,
@@ -98,10 +130,88 @@ pub struct Application {
 
     rename_input: Option<String>,
     pending_pinned_close: Option<usize>,
+    command_palette: Option<CommandPaletteState>,
+}
+
+#[derive(Default)]
+struct PersistenceState {
+    pending: Option<Workspace>,
+    stopping: bool,
+}
+
+#[derive(Default)]
+struct PersistenceQueue {
+    state: Mutex<PersistenceState>,
+    ready: Condvar,
+}
+
+impl WindowSession {
+    fn new(
+        window: Arc<Window>,
+        renderer: Renderer,
+        tabs: Vec<TabSession>,
+        active_tab: usize,
+    ) -> Self {
+        Self {
+            window: Some(window),
+            renderer: Some(renderer),
+            tabs,
+            active_tab,
+            modifiers: ModifiersState::empty(),
+            cursor_position: PhysicalPosition::new(0.0, 0.0),
+            selecting: None,
+            selection_pending: None,
+            last_left_click: None,
+            dragging_tab: None,
+            tab_drag_changed: false,
+            resizing_split: None,
+            split_resize_changed: false,
+            rename_input: None,
+            pending_pinned_close: None,
+            command_palette: None,
+        }
+    }
+}
+
+struct Application {
+    started_at: Instant,
+    proxy: EventLoopProxy<UserEvent>,
+    windows: HashMap<WindowId, WindowSession>,
+    focused_window: Option<WindowId>,
+    #[cfg(target_os = "macos")]
+    native_menu: Option<crate::native_menu::NativeMenu>,
+    current_window: Option<WindowSession>,
+    closed_tabs: Vec<TabState>,
+    next_pane_id: u64,
+    startup_workspace: Option<Workspace>,
+    persistence_queue: Arc<PersistenceQueue>,
+    persistence_worker: Option<std::thread::JoinHandle<()>>,
+    config: AppConfig,
+    keybindings: KeyBindings,
+    theme_name: String,
+    clipboard: Option<Clipboard>,
     first_shell_output_seen: bool,
     first_frame_seen: bool,
     profile_input: bool,
     fatal_error: Option<anyhow::Error>,
+}
+
+impl Deref for Application {
+    type Target = WindowSession;
+
+    fn deref(&self) -> &Self::Target {
+        self.current_window
+            .as_ref()
+            .expect("window operation requires an active window session")
+    }
+}
+
+impl DerefMut for Application {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.current_window
+            .as_mut()
+            .expect("window operation requires an active window session")
+    }
 }
 
 impl Application {
@@ -134,35 +244,38 @@ impl Application {
         if cfg!(debug_assertions) {
             eprintln!("config: {}", loaded.path.display());
         }
+        let persistence_queue = Arc::new(PersistenceQueue::default());
+        let persistence_worker = {
+            let queue = Arc::clone(&persistence_queue);
+            let path = workspace_path.clone();
+            match std::thread::Builder::new()
+                .name("workspace-writer".into())
+                .spawn(move || workspace_writer(queue, path))
+            {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    eprintln!("could not start workspace writer: {error}");
+                    None
+                }
+            }
+        };
         Self {
             started_at,
             proxy,
-            window: None,
-            renderer: None,
-            tabs: Vec::new(),
+            windows: HashMap::new(),
+            focused_window: None,
+            #[cfg(target_os = "macos")]
+            native_menu: None,
+            current_window: None,
             closed_tabs: Vec::new(),
-            active_tab: 0,
             next_pane_id: 1,
             startup_workspace: workspace_load.workspace,
-            workspace_path,
+            persistence_queue,
+            persistence_worker,
             config: loaded.config,
             keybindings,
             theme_name,
             clipboard: None,
-            modifiers: ModifiersState::empty(),
-            cursor_position: PhysicalPosition::new(0.0, 0.0),
-            selecting: None,
-            selection_pending: None,
-            last_left_click: None,
-
-            dragging_tab: None,
-            tab_drag_changed: false,
-
-            resizing_split: None,
-            split_resize_changed: false,
-
-            rename_input: None,
-            pending_pinned_close: None,
             first_shell_output_seen: false,
             first_frame_seen: false,
             profile_input: std::env::var_os("GRIN_PROFILE_INPUT").is_some(),
@@ -171,16 +284,42 @@ impl Application {
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        let initial_size = self
+        let window_states = self
             .startup_workspace
-            .as_ref()
-            .map(|workspace| {
-                LogicalSize::new(
-                    workspace.window_width as f64,
-                    workspace.window_height as f64,
-                )
-            })
-            .unwrap_or_else(|| LogicalSize::new(960.0, 600.0));
+            .take()
+            .map(|workspace| workspace.windows)
+            .unwrap_or_default();
+        if window_states.is_empty() {
+            let window_id =
+                self.create_window_session(event_loop, LogicalSize::new(960.0, 600.0))?;
+            self.queue_initial_sessions(window_id, None)?;
+        } else {
+            let mut created = 0;
+            for state in window_states {
+                let size = LogicalSize::new(
+                    state.window_width.max(480) as f64,
+                    state.window_height.max(260) as f64,
+                );
+                match self.create_window_session(event_loop, size) {
+                    Ok(window_id) => {
+                        self.queue_initial_sessions(window_id, Some(state))?;
+                        created += 1;
+                    }
+                    Err(error) => eprintln!("workspace window restore failed: {error:#}"),
+                }
+            }
+            if created == 0 {
+                anyhow::bail!("could not restore any workspace window");
+            }
+        }
+        Ok(())
+    }
+
+    fn create_window_session(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        initial_size: LogicalSize<f64>,
+    ) -> Result<WindowId> {
         let window = Arc::new(
             event_loop
                 .create_window(
@@ -200,12 +339,34 @@ impl Application {
         ))
         .context("GPU renderer initialization failed")?;
         timing(self.started_at, "GPU and font renderer initialized");
-        self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.queue_initial_sessions()?;
+        let window_id = window.id();
+        self.windows.insert(
+            window_id,
+            WindowSession::new(window, renderer, Vec::new(), 0),
+        );
+        self.activate_window(window_id);
         self.update_window_title();
         self.request_redraw();
-        Ok(())
+        self.deactivate_window();
+        Ok(window_id)
+    }
+
+    fn activate_window(&mut self, window_id: WindowId) -> bool {
+        debug_assert!(self.current_window.is_none());
+        self.current_window = self.windows.remove(&window_id);
+        self.current_window.is_some()
+    }
+
+    fn deactivate_window(&mut self) {
+        let Some(session) = self.current_window.take() else {
+            return;
+        };
+        let window_id = session
+            .window
+            .as_ref()
+            .expect("stored window session has a window")
+            .id();
+        self.windows.insert(window_id, session);
     }
 
     fn render_options(&self) -> RenderOptions {
@@ -224,16 +385,19 @@ impl Application {
         }
     }
 
-    fn queue_initial_sessions(&mut self) -> Result<()> {
-        let workspace = self.startup_workspace.take();
+    fn queue_initial_sessions(
+        &mut self,
+        window_id: WindowId,
+        window_state: Option<WindowState>,
+    ) -> Result<()> {
         let cursor_shape = self.config.cursor_shape();
         let proxy = self.proxy.clone();
         std::thread::Builder::new()
             .name("workspace-restorer".into())
             .spawn(move || {
-                let result = build_initial_sessions(workspace, cursor_shape, proxy.clone())
+                let result = build_initial_sessions(window_state, cursor_shape, proxy.clone())
                     .map_err(|error| error.to_string());
-                let _ = proxy.send_event(UserEvent::InitialReady(result));
+                let _ = proxy.send_event(UserEvent::InitialReady { window_id, result });
             })
             .context("could not start workspace restoration worker")?;
         Ok(())
@@ -247,7 +411,7 @@ impl Application {
                 }
                 self.tabs = initial.tabs;
                 self.active_tab = initial.active_tab;
-                self.next_pane_id = initial.next_pane_id;
+                self.next_pane_id = self.next_pane_id.max(initial.next_pane_id);
                 self.resize_active_panes();
                 self.process_pty_events();
                 timing(self.started_at, "workspace PTYs spawned");
@@ -271,6 +435,11 @@ impl Application {
         rows: u16,
         working_directory: PathBuf,
     ) {
+        let window_id = self
+            .window
+            .as_ref()
+            .expect("pane spawn requires a window")
+            .id();
         let id = PaneId(self.next_pane_id);
         self.next_pane_id = self.next_pane_id.saturating_add(1);
         let cursor_shape = self.config.cursor_shape();
@@ -290,7 +459,11 @@ impl Application {
                     },
                 )
                 .map_err(|error| error.to_string());
-                let _ = event_proxy.send_event(UserEvent::PaneSpawned { target, result });
+                let _ = event_proxy.send_event(UserEvent::PaneSpawned {
+                    window_id,
+                    target,
+                    result,
+                });
             });
         if let Err(error) = spawn {
             eprintln!("could not start PTY spawner thread: {error}");
@@ -341,6 +514,11 @@ impl Application {
         };
 
         let cursor_shape = self.config.cursor_shape();
+        let window_id = self
+            .window
+            .as_ref()
+            .expect("tab restore requires a window")
+            .id();
         let restore_proxy = self.proxy.clone();
         let event_proxy = self.proxy.clone();
 
@@ -350,7 +528,7 @@ impl Application {
                 let result = restore_tab_session(state, cursor_shape, restore_proxy)
                     .map_err(|error| error.to_string());
 
-                let _ = event_proxy.send_event(UserEvent::TabRestored(result));
+                let _ = event_proxy.send_event(UserEvent::TabRestored { window_id, result });
             });
 
         if let Err(error) = spawn {
@@ -588,7 +766,16 @@ impl Application {
         &self.tabs[self.active_tab]
     }
     fn active_tab_mut(&mut self) -> &mut TabSession {
-        &mut self.tabs[self.active_tab]
+        let active_tab = self
+            .current_window
+            .as_ref()
+            .expect("active tab requires a window session")
+            .active_tab;
+        &mut self
+            .current_window
+            .as_mut()
+            .expect("active tab requires a window session")
+            .tabs[active_tab]
     }
     fn ensure_active_tab_visible(&mut self) {
         if self.tabs.is_empty() {
@@ -616,6 +803,7 @@ impl Application {
         let active_tab = self.active_tab;
         let mut redraw = false;
         let mut title_changed = false;
+        let mut shell_output_seen = false;
         for (tab_index, tab) in self.tabs.iter_mut().enumerate() {
             let ids: Vec<_> = tab.panes.keys().copied().collect();
             for id in ids {
@@ -624,10 +812,7 @@ impl Application {
                     .get_mut(&id)
                     .expect("pane id came from the same map")
                     .process_pty_events();
-                if update.changed && !self.first_shell_output_seen {
-                    self.first_shell_output_seen = true;
-                    timing(self.started_at, "first shell output");
-                }
+                shell_output_seen |= update.changed;
                 if let Some(error) = update.error {
                     eprintln!("pane {} stopped: {error}", id.0);
                 }
@@ -641,6 +826,10 @@ impl Application {
                 }
             }
         }
+        if shell_output_seen && !self.first_shell_output_seen {
+            self.first_shell_output_seen = true;
+            timing(self.started_at, "first shell output");
+        }
         if title_changed {
             self.update_window_title();
             redraw = true;
@@ -651,7 +840,9 @@ impl Application {
     }
 
     fn resize(&mut self) {
-        let Some(window) = &self.window else { return };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
         let Some(renderer) = &mut self.renderer else {
             return;
         };
@@ -856,11 +1047,15 @@ impl Application {
         true
     }
 
-    fn send_key(&mut self, event_loop: &ActiveEventLoop, event: &winit::event::KeyEvent) {
+    fn send_key(&mut self, event: &winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
         }
         if self.tabs.is_empty() {
+            return;
+        }
+
+        if self.handle_palette_key(event) {
             return;
         }
 
@@ -888,7 +1083,7 @@ impl Application {
         if let Some(chord) = key_chord(event, self.modifiers)
             && let Some(action) = self.keybindings.action(&chord)
         {
-            self.dispatch_action(event_loop, action);
+            self.dispatch_action(action);
             return;
         }
         if self.handle_rename_key(event) || self.handle_search_key(event) {
@@ -1012,7 +1207,14 @@ impl Application {
         }
     }
 
-    fn dispatch_action(&mut self, event_loop: &ActiveEventLoop, action: Action) {
+    fn dispatch_action(&mut self, action: Action) {
+        if action == Action::ToggleCommandPalette {
+            if self.command_palette.take().is_none() {
+                self.command_palette = Some(CommandPaletteState::default());
+            }
+            self.request_redraw();
+            return;
+        }
         if let Some(index) = action.tab_index() {
             self.switch_tab(index);
             return;
@@ -1023,21 +1225,27 @@ impl Application {
                 self.queue_new_tab(directory);
             }
             Action::Close => {
-                if self.close_focused_pane() {
-                    self.pending_pinned_close = None;
-                    self.update_window_title();
-                    return;
-                }
-
-                let index = self.active_tab;
-
-                if !self.confirm_pinned_tab_close(index) {
-                    return;
-                }
-
-                if !self.close_tab_at(index) {
-                    self.persist_workspace();
-                    event_loop.exit();
+                match close_target(
+                    self.active_tab().root.panes().len(),
+                    self.tabs.len(),
+                    self.windows.len(),
+                ) {
+                    CloseTarget::Pane => {
+                        self.close_focused_pane();
+                    }
+                    CloseTarget::Tab => {
+                        let index = self.active_tab;
+                        if self.confirm_pinned_tab_close(index) {
+                            self.close_tab_at(index);
+                        }
+                    }
+                    CloseTarget::Window | CloseTarget::Application => {
+                        let index = self.active_tab;
+                        if self.confirm_pinned_tab_close(index) {
+                            self.persist_workspace();
+                            self.current_window.take();
+                        }
+                    }
                 }
             }
             Action::CloseTab => {
@@ -1049,7 +1257,7 @@ impl Application {
 
                 if !self.close_tab_at(index) {
                     self.persist_workspace();
-                    event_loop.exit();
+                    self.current_window.take();
                 }
             }
             Action::NextTab => self.switch_tab((self.active_tab + 1) % self.tabs.len()),
@@ -1109,6 +1317,7 @@ impl Application {
             }
             Action::ThemeDark => self.apply_theme("dark"),
             Action::ThemeLight => self.apply_theme("light"),
+            Action::ToggleCommandPalette => unreachable!("handled before action dispatch"),
             Action::SelectTab1
             | Action::SelectTab2
             | Action::SelectTab3
@@ -1119,6 +1328,45 @@ impl Application {
             | Action::SelectTab8
             | Action::SelectTab9 => unreachable!(),
         }
+    }
+
+    fn handle_palette_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.command_palette.is_none() {
+            return false;
+        }
+        if let Some(chord) = key_chord(event, self.modifiers)
+            && self.keybindings.action(&chord) == Some(Action::ToggleCommandPalette)
+        {
+            self.command_palette = None;
+            self.request_redraw();
+            return true;
+        }
+        let mut palette = self.command_palette.take().expect("palette checked above");
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = palette.selected_action();
+                self.command_palette = None;
+                if let Some(action) = action {
+                    self.dispatch_action(action);
+                } else {
+                    self.request_redraw();
+                }
+                return true;
+            }
+            Key::Named(NamedKey::ArrowDown) => palette.move_selection(1),
+            Key::Named(NamedKey::ArrowUp) => palette.move_selection(-1),
+            Key::Named(NamedKey::Home) => palette.move_selection(-(palette.selected as isize)),
+            Key::Named(NamedKey::End) => palette.move_selection(isize::MAX),
+            Key::Named(NamedKey::Backspace) => palette.edit(None, true),
+            _ => palette.edit(event.text.as_deref(), false),
+        }
+        self.command_palette = Some(palette);
+        self.request_redraw();
+        true
     }
 
     fn focus_direction(&mut self, direction: Direction) {
@@ -1194,8 +1442,21 @@ impl Application {
             eprintln!("theme: {diagnostic}");
         }
         self.theme_name = theme.name.clone();
-        if let Some(renderer) = &mut self.renderer {
-            renderer.set_theme(render_theme(&theme));
+        let render_theme = render_theme(&theme);
+        if let Some(renderer) = self
+            .current_window
+            .as_mut()
+            .and_then(|session| session.renderer.as_mut())
+        {
+            renderer.set_theme(render_theme.clone());
+        }
+        for session in self.windows.values_mut() {
+            if let Some(renderer) = &mut session.renderer {
+                renderer.set_theme(render_theme.clone());
+            }
+            if let Some(window) = &session.window {
+                window.request_redraw();
+            }
         }
         self.persist_workspace();
         self.request_redraw();
@@ -1333,7 +1594,15 @@ impl Application {
         count
     }
 
-    fn mouse_button(&mut self, state: ElementState, button: MouseButton) {
+    fn mouse_button(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        state: ElementState,
+        button: MouseButton,
+    ) {
+        if self.handle_palette_mouse_button(state, button) {
+            return;
+        }
         if button != MouseButton::Left {
             return;
         }
@@ -1342,8 +1611,46 @@ impl Application {
             self.selecting = None;
             self.selection_pending = None;
 
-            self.dragging_tab = None;
+            let tab_drag = self.dragging_tab.take();
+
+            if let Some(drag) = tab_drag {
+                let dropped_on_tab_bar = self
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.tab_bar_at(self.cursor_position));
+
+                if dropped_on_tab_bar
+                    && drag.source < self.tabs.len()
+                    && drag.target < self.tabs.len()
+                    && self.tabs[drag.source].pinned == self.tabs[drag.target].pinned
+                {
+                    if drag.source != drag.target {
+                        let tab = self.tabs.remove(drag.source);
+                        self.tabs.insert(drag.target, tab);
+                        self.active_tab = drag.target;
+                        self.tab_drag_changed = true;
+                        self.ensure_active_tab_visible();
+                    }
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.complete_tab_drag(drag.target);
+                    }
+                } else if !dropped_on_tab_bar && drag.source < self.tabs.len() {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.clear_tab_drag_visual();
+                    }
+                    if self.detach_tab(event_loop, drag.source) {
+                        return;
+                    }
+                } else if let Some(renderer) = &mut self.renderer {
+                    renderer.clear_tab_drag_visual();
+                }
+            } else if let Some(renderer) = &mut self.renderer {
+                renderer.clear_tab_drag_visual();
+            }
+
             self.resizing_split = None;
+            self.update_mouse_cursor(self.cursor_position);
+            self.update_renderer_hover(self.cursor_position);
 
             let layout_changed = self.tab_drag_changed || self.split_resize_changed;
 
@@ -1354,6 +1661,7 @@ impl Application {
                 self.persist_workspace();
             }
 
+            self.request_redraw();
             return;
         }
 
@@ -1381,10 +1689,36 @@ impl Application {
 
                 self.close_tab_at(index);
             } else {
+                let position = self.cursor_position;
+
+                let grab_offset_x = renderer
+                    .tab_rect(index, self.tabs.len())
+                    .map(|rect| position.x - f64::from(rect.x))
+                    .unwrap_or(0.0);
+
                 self.switch_tab(index);
 
-                self.dragging_tab = Some(index);
+                let drag = TabDragState {
+                    source: index,
+                    target: index,
+                    grab_offset_x,
+                    position,
+                };
+
+                self.dragging_tab = Some(drag);
                 self.tab_drag_changed = false;
+
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_tab_drag_visual(
+                        drag.source,
+                        drag.target,
+                        drag.position,
+                        drag.grab_offset_x,
+                    );
+                    renderer.set_hover(HoverTarget::DraggedTab);
+                }
+
+                self.request_redraw();
             }
 
             return;
@@ -1420,6 +1754,8 @@ impl Application {
                 self.dragging_tab = None;
                 self.selecting = None;
                 self.selection_pending = None;
+
+                self.update_renderer_hover(position);
 
                 return;
             }
@@ -1459,6 +1795,8 @@ impl Application {
                 self.dragging_tab = None;
                 self.selecting = None;
                 self.selection_pending = None;
+
+                self.update_renderer_hover(position);
 
                 return;
             }
@@ -1608,6 +1946,130 @@ impl Application {
         self.request_redraw();
     }
 
+    fn palette_layout(&self) -> Option<PaletteLayout> {
+        let palette = self.command_palette.as_ref()?;
+        self.renderer.as_ref().map(|renderer| {
+            renderer.command_palette_layout(
+                palette
+                    .matches()
+                    .len()
+                    .saturating_sub(palette.scroll_offset)
+                    .min(crate::palette::VISIBLE_ROWS)
+                    .max(1),
+            )
+        })
+    }
+
+    fn handle_palette_mouse_button(&mut self, state: ElementState, button: MouseButton) -> bool {
+        if self.command_palette.is_none() {
+            return false;
+        }
+        if state == ElementState::Released {
+            return true;
+        }
+        if button != MouseButton::Left {
+            return true;
+        }
+        let Some(layout) = self.palette_layout() else {
+            return true;
+        };
+        if !layout.outer.contains(self.cursor_position) {
+            self.command_palette = None;
+            self.request_redraw();
+            return true;
+        }
+        let selected = layout
+            .rows
+            .iter()
+            .position(|rect| rect.contains(self.cursor_position));
+        if let Some(visible) = selected {
+            let action = {
+                let palette = self.command_palette.as_mut().expect("palette exists");
+                palette.selected = palette.scroll_offset + visible;
+                palette.selected_action()
+            };
+            if let Some(action) = action {
+                self.command_palette = None;
+                self.dispatch_action(action);
+            } else {
+                self.request_redraw();
+            }
+        }
+        true
+    }
+
+    fn detach_tab(&mut self, event_loop: &ActiveEventLoop, source: usize) -> bool {
+        let Some(source_window) = self.window.as_ref() else {
+            return false;
+        };
+        let source_size = source_window.inner_size();
+        let source_scale = source_window.scale_factor().max(1.0);
+        let logical_size = LogicalSize::new(
+            (f64::from(source_size.width) / source_scale).max(480.0),
+            (f64::from(source_size.height) / source_scale).max(260.0),
+        );
+        let window = match event_loop.create_window(
+            Window::default_attributes()
+                .with_title("Grin Terminal")
+                .with_inner_size(logical_size)
+                .with_min_inner_size(LogicalSize::new(480.0, 260.0))
+                .with_transparent(self.config.window.opacity < 1.0),
+        ) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("could not detach tab: native window creation failed: {error}");
+                return false;
+            }
+        };
+        window.set_ime_allowed(true);
+
+        let renderer = match pollster::block_on(Renderer::new_with_options(
+            Arc::clone(&window),
+            self.render_options(),
+        )) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("could not detach tab: renderer initialization failed: {error}");
+                return false;
+            }
+        };
+
+        let tab = self.tabs.remove(source);
+        if let Some(renderer) = &mut self.renderer {
+            for pane in tab.panes.keys() {
+                renderer.remove_pane(pane.0);
+            }
+        }
+
+        let title = tab.title.clone();
+        let destination_id = window.id();
+        let mut destination = WindowSession::new(window, renderer, vec![tab], 0);
+        if let Some(window) = &destination.window {
+            window.set_title(&format!("Grin — {title}"));
+            window.request_redraw();
+        }
+        destination.pending_pinned_close = None;
+        self.windows.insert(destination_id, destination);
+
+        if self.tabs.is_empty() {
+            self.persist_workspace();
+            self.current_window.take();
+            return true;
+        }
+
+        self.active_tab = if self.active_tab > source {
+            self.active_tab - 1
+        } else {
+            self.active_tab.min(self.tabs.len() - 1)
+        };
+        self.pending_pinned_close = None;
+        self.ensure_active_tab_visible();
+        self.resize_active_panes();
+        self.update_window_title();
+        self.persist_workspace();
+        false
+    }
+
     fn update_mouse_cursor(&self, position: PhysicalPosition<f64>) {
         let Some(window) = &self.window else {
             return;
@@ -1683,9 +2145,99 @@ impl Application {
         window.set_cursor(CursorIcon::Default);
     }
 
+    fn update_renderer_hover(&mut self, position: PhysicalPosition<f64>) {
+        let hover = if self.dragging_tab.is_some() {
+            HoverTarget::DraggedTab
+        } else if let Some(drag) = &self.resizing_split {
+            HoverTarget::PaneDivider {
+                x: position.x as f32,
+                y: position.y as f32,
+                vertical: drag.handle.axis() == SplitAxis::Vertical,
+                active: true,
+            }
+        } else if let Some(renderer) = &self.renderer {
+            if renderer.new_tab_at(position, self.tabs.len()) {
+                HoverTarget::NewTab
+            } else if let Some(index) = renderer.tab_at(position, self.tabs.len()) {
+                if renderer.tab_close_at(position, index, self.tabs.len()) {
+                    HoverTarget::TabClose(index)
+                } else {
+                    HoverTarget::Tab(index)
+                }
+            } else if self.active_tab().zoomed_pane.is_none() {
+                let content = renderer.content_rect();
+                let rect = Rect {
+                    x: content.x,
+                    y: content.y,
+                    width: content.width,
+                    height: content.height,
+                };
+                self.active_tab()
+                    .root
+                    .split_handle_at(position.x as f32, position.y as f32, rect, 6.0)
+                    .map_or(HoverTarget::None, |handle| HoverTarget::PaneDivider {
+                        x: position.x as f32,
+                        y: position.y as f32,
+                        vertical: handle.axis() == SplitAxis::Vertical,
+                        active: false,
+                    })
+            } else {
+                HoverTarget::None
+            }
+        } else {
+            HoverTarget::None
+        };
+
+        let changed = self
+            .renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.set_hover(hover));
+        if changed {
+            self.request_redraw();
+        }
+    }
+
     fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_position = position;
+        if self.command_palette.is_some() {
+            let layout = self.palette_layout();
+            if let Some(window) = &self.window {
+                let icon = layout
+                    .as_ref()
+                    .and_then(|layout| {
+                        if layout.input.contains(position) {
+                            Some(CursorIcon::Text)
+                        } else if layout.rows.iter().any(|rect| rect.contains(position)) {
+                            Some(CursorIcon::Pointer)
+                        } else {
+                            Some(CursorIcon::Default)
+                        }
+                    })
+                    .unwrap_or(CursorIcon::Default);
+                window.set_cursor(icon);
+            }
+            if let Some(visible) = layout
+                .as_ref()
+                .and_then(|layout| layout.rows.iter().position(|rect| rect.contains(position)))
+            {
+                let changed = {
+                    let palette = self.command_palette.as_mut().expect("palette exists");
+                    let next = palette.scroll_offset + visible;
+                    if palette.selected == next {
+                        false
+                    } else {
+                        palette.selected = next;
+                        true
+                    }
+                };
+                if changed {
+                    self.request_redraw();
+                }
+            }
+            return;
+        }
         self.update_mouse_cursor(position);
+        self.update_renderer_hover(position);
 
         let resize_drag = self
             .resizing_split
@@ -1731,35 +2283,36 @@ impl Application {
             return;
         }
 
-        if let Some(source) = self.dragging_tab {
-            let Some(target) = self
+        if let Some(mut drag) = self.dragging_tab {
+            drag.position = position;
+
+            let count = self.tabs.len();
+
+            let target = self
                 .renderer
                 .as_ref()
-                .and_then(|renderer| renderer.tab_at(position, self.tabs.len()))
-            else {
-                return;
-            };
+                .filter(|renderer| renderer.tab_bar_at(position))
+                .and_then(|renderer| renderer.tab_at(position, count));
 
-            if source == target {
-                return;
+            if let Some(target) = target {
+                if drag.source < self.tabs.len()
+                    && target < self.tabs.len()
+                    && self.tabs[drag.source].pinned == self.tabs[target].pinned
+                {
+                    drag.target = target;
+                }
             }
 
-            if source >= self.tabs.len() || target >= self.tabs.len() {
-                return;
+            self.dragging_tab = Some(drag);
+
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_tab_drag_visual(
+                    drag.source,
+                    drag.target,
+                    drag.position,
+                    drag.grab_offset_x,
+                );
             }
-
-            // Pinned tabs остаются только внутри pinned-группы.
-            if self.tabs[source].pinned != self.tabs[target].pinned {
-                return;
-            }
-
-            let tab = self.tabs.remove(source);
-            self.tabs.insert(target, tab);
-
-            self.active_tab = target;
-            self.dragging_tab = Some(target);
-            self.tab_drag_changed = true;
-            self.pending_pinned_close = None;
 
             self.request_redraw();
             return;
@@ -1897,6 +2450,20 @@ impl Application {
     }
 
     fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        if self.command_palette.is_some() {
+            let amount = match delta {
+                MouseScrollDelta::LineDelta(_, y) => -y.round() as isize,
+                MouseScrollDelta::PixelDelta(position) => (-position.y / 28.0).round() as isize,
+            };
+            if amount != 0 {
+                self.command_palette
+                    .as_mut()
+                    .expect("palette exists")
+                    .scroll(amount);
+                self.request_redraw();
+            }
+            return;
+        }
         if self.tabs.is_empty() {
             return;
         }
@@ -1968,7 +2535,7 @@ impl Application {
                 .renderer
                 .as_mut()
                 .expect("render requested after initialization")
-                .render_panes(&[], &[]);
+                .render_panes(&[], &[], None);
             if let Err(error) = result {
                 self.fail(event_loop, error);
             }
@@ -1990,8 +2557,14 @@ impl Application {
         let layout = self.active_layout();
         let active = self.active_tab;
         let focused = self.tabs[active].focused_pane;
+        let multiple_panes = self.tabs[active].root.panes().len() > 1;
+        let keybindings = &self.keybindings;
         let result = {
-            let tab = &self.tabs[active];
+            let session = self
+                .current_window
+                .as_mut()
+                .expect("render requires a window session");
+            let tab = &session.tabs[active];
             let panes: Vec<_> = layout
                 .iter()
                 .filter_map(|(id, rect)| {
@@ -2003,10 +2576,60 @@ impl Application {
                     })
                 })
                 .collect();
-            self.renderer
+            let palette_rows: Vec<_> = session
+                .command_palette
+                .as_ref()
+                .map(|palette| {
+                    palette
+                        .matches()
+                        .into_iter()
+                        .skip(palette.scroll_offset)
+                        .take(crate::palette::VISIBLE_ROWS)
+                        .map(|info| {
+                            let contextual_close = multiple_panes && info.action == Action::Close;
+                            CommandPaletteRow {
+                                title: if contextual_close {
+                                    "Close Pane"
+                                } else {
+                                    info.title
+                                },
+                                category: if contextual_close {
+                                    "Pane"
+                                } else {
+                                    info.category
+                                },
+                                shortcut: keybindings
+                                    .shortcut_label(info.action)
+                                    .unwrap_or_default(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let palette_layout: Option<PaletteLayout> =
+                session.command_palette.as_ref().map(|_| {
+                    session
+                        .renderer
+                        .as_ref()
+                        .expect("renderer exists")
+                        .command_palette_layout(palette_rows.len().max(1))
+                });
+            let palette = session
+                .command_palette
+                .as_ref()
+                .zip(palette_layout.as_ref())
+                .map(|(palette, layout)| CommandPaletteView {
+                    query: &palette.query,
+                    rows: &palette_rows,
+                    selected: palette.selected.saturating_sub(palette.scroll_offset),
+                    scroll_offset: palette.scroll_offset,
+                    layout,
+                });
+            session
+                .renderer
                 .as_mut()
                 .expect("render requested after initialization")
-                .render_panes(&panes, &labels)
+                .render_panes(&panes, &labels, palette.as_ref())
         };
         if let Err(error) = result {
             self.fail(event_loop, error);
@@ -2054,38 +2677,106 @@ impl Application {
     }
 
     fn persist_workspace(&self) {
-        if !self.config.workspace.restore || self.tabs.is_empty() {
+        if !self.config.workspace.restore {
             return;
         }
-        let (size, scale_factor) = self
-            .window
-            .as_ref()
-            .map(|window| (window.inner_size(), window.scale_factor()))
-            .unwrap_or_default();
+        let mut windows: Vec<_> = self
+            .windows
+            .values()
+            .chain(self.current_window.iter())
+            .filter_map(window_snapshot)
+            .collect();
+        windows.sort_by_key(|window| {
+            window
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter())
+                .map(|pane| pane.id.0)
+                .min()
+                .unwrap_or(u64::MAX)
+        });
+        if windows.is_empty() {
+            return;
+        }
         let workspace = Workspace {
             version: WORKSPACE_VERSION,
-            window_width: (f64::from(size.width) / scale_factor.max(1.0))
-                .round()
-                .max(320.0) as u32,
-            window_height: (f64::from(size.height) / scale_factor.max(1.0))
-                .round()
-                .max(180.0) as u32,
-            active_tab: self.active_tab,
             theme: self.theme_name.clone(),
-            tabs: self.tabs.iter().map(TabSession::snapshot).collect(),
+            windows,
         };
-        if let Err(error) = workspace.save_atomic(&self.workspace_path) {
-            eprintln!(
-                "could not save workspace {}: {error}",
-                self.workspace_path.display()
-            );
+        if let Ok(mut state) = self.persistence_queue.state.lock()
+            && !state.stopping
+        {
+            state.pending = Some(workspace);
+            self.persistence_queue.ready.notify_one();
+        }
+    }
+
+    fn finish_persistence(&mut self) {
+        if let Ok(mut state) = self.persistence_queue.state.lock() {
+            state.stopping = true;
+            self.persistence_queue.ready.notify_one();
+        }
+        if let Some(worker) = self.persistence_worker.take()
+            && worker.join().is_err()
+        {
+            eprintln!("workspace writer thread panicked");
+        }
+    }
+}
+
+fn window_snapshot(session: &WindowSession) -> Option<WindowState> {
+    if session.tabs.is_empty() {
+        return None;
+    }
+    let window = session.window.as_ref()?;
+    let size = window.inner_size();
+    let scale_factor = window.scale_factor().max(1.0);
+    Some(WindowState {
+        window_width: (f64::from(size.width) / scale_factor)
+            .round()
+            .clamp(320.0, 7680.0) as u32,
+        window_height: (f64::from(size.height) / scale_factor)
+            .round()
+            .clamp(180.0, 4320.0) as u32,
+        active_tab: session.active_tab.min(session.tabs.len() - 1),
+        tabs: session.tabs.iter().map(TabSession::snapshot).collect(),
+    })
+}
+
+fn workspace_writer(queue: Arc<PersistenceQueue>, path: PathBuf) {
+    loop {
+        let workspace = {
+            let Ok(mut state) = queue.state.lock() else {
+                return;
+            };
+            while state.pending.is_none() && !state.stopping {
+                let Ok(next) = queue.ready.wait(state) else {
+                    return;
+                };
+                state = next;
+            }
+            match state.pending.take() {
+                Some(workspace) => workspace,
+                None => return,
+            }
+        };
+        if let Err(error) = workspace.save_atomic(&path) {
+            eprintln!("could not save workspace {}: {error}", path.display());
         }
     }
 }
 
 impl ApplicationHandler<UserEvent> for Application {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none()
+        #[cfg(target_os = "macos")]
+        if self.native_menu.is_none() {
+            self.native_menu = Some(crate::native_menu::install(
+                self.proxy.clone(),
+                &self.keybindings,
+            ));
+        }
+        if self.windows.is_empty()
+            && self.current_window.is_none()
             && let Err(error) = self.initialize(event_loop)
         {
             self.fail(event_loop, error);
@@ -2093,10 +2784,46 @@ impl ApplicationHandler<UserEvent> for Application {
     }
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::PtyReady => self.process_pty_events(),
-            UserEvent::InitialReady(result) => self.complete_initial_sessions(result),
-            UserEvent::PaneSpawned { target, result } => self.complete_pane_spawn(target, result),
-            UserEvent::TabRestored(result) => self.complete_tab_restore(result),
+            #[cfg(target_os = "macos")]
+            UserEvent::MenuAction(action) => {
+                if let Some(window_id) = self.focused_window
+                    && self.activate_window(window_id)
+                {
+                    self.dispatch_action(action);
+                    self.deactivate_window();
+                }
+            }
+            UserEvent::PtyReady => {
+                let window_ids: Vec<_> = self.windows.keys().copied().collect();
+                for window_id in window_ids {
+                    if self.activate_window(window_id) {
+                        self.process_pty_events();
+                        self.deactivate_window();
+                    }
+                }
+            }
+            UserEvent::InitialReady { window_id, result } => {
+                if self.activate_window(window_id) {
+                    self.complete_initial_sessions(result);
+                    self.deactivate_window();
+                }
+            }
+            UserEvent::PaneSpawned {
+                window_id,
+                target,
+                result,
+            } => {
+                if self.activate_window(window_id) {
+                    self.complete_pane_spawn(target, result);
+                    self.deactivate_window();
+                }
+            }
+            UserEvent::TabRestored { window_id, result } => {
+                if self.activate_window(window_id) {
+                    self.complete_tab_restore(result);
+                    self.deactivate_window();
+                }
+            }
         }
     }
     fn window_event(
@@ -2105,30 +2832,51 @@ impl ApplicationHandler<UserEvent> for Application {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if self
-            .window
-            .as_ref()
-            .is_none_or(|window| window.id() != window_id)
-        {
+        if !self.activate_window(window_id) {
             return;
         }
         match event {
             WindowEvent::CloseRequested => {
                 self.persist_workspace();
-                event_loop.exit();
+                self.current_window.take();
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => self.resize(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            WindowEvent::KeyboardInput { event, .. } => self.send_key(event_loop, &event),
+            WindowEvent::Focused(true) => self.focused_window = Some(window_id),
+            WindowEvent::Focused(false) if self.focused_window == Some(window_id) => {
+                self.focused_window = None
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.send_key(&event),
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
-            WindowEvent::MouseInput { state, button, .. } => self.mouse_button(state, button),
+            WindowEvent::CursorLeft { .. } => {
+                let changed = self
+                    .renderer
+                    .as_mut()
+                    .is_some_and(|renderer| renderer.set_hover(HoverTarget::None));
+                if changed {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.mouse_button(event_loop, state, button)
+            }
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::RedrawRequested => self.render(event_loop),
             _ => {}
         }
+        self.deactivate_window();
+        if self.windows.is_empty() {
+            event_loop.exit();
+        }
     }
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.persist_workspace();
+        let window_ids: Vec<_> = self.windows.keys().copied().collect();
+        for window_id in window_ids {
+            if self.activate_window(window_id) {
+                self.persist_workspace();
+                self.deactivate_window();
+            }
+        }
     }
 }
 
@@ -2139,9 +2887,11 @@ pub fn run() -> Result<()> {
         .context("could not initialize native event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut application = Application::new(event_loop.create_proxy(), started_at);
-    event_loop
+    let run_result = event_loop
         .run_app(&mut application)
-        .context("native event loop failed")?;
+        .context("native event loop failed");
+    application.finish_persistence();
+    run_result?;
     if let Some(error) = application.fatal_error {
         return Err(error);
     }
@@ -2149,12 +2899,12 @@ pub fn run() -> Result<()> {
 }
 
 fn build_initial_sessions(
-    workspace: Option<Workspace>,
+    window: Option<WindowState>,
     cursor_shape: terminal_core::CursorShape,
     proxy: EventLoopProxy<UserEvent>,
 ) -> Result<InitialSessions> {
-    if let Some(workspace) = workspace {
-        match restore_initial_sessions(workspace, cursor_shape, proxy.clone()) {
+    if let Some(window) = window {
+        match restore_initial_sessions(window, cursor_shape, proxy.clone()) {
             Ok(initial) => return Ok(initial),
             Err(error) => {
                 let mut initial = fresh_initial_session(cursor_shape, proxy)?;
@@ -2225,17 +2975,17 @@ fn restore_tab_session(
 }
 
 fn restore_initial_sessions(
-    workspace: Workspace,
+    window: WindowState,
     cursor_shape: terminal_core::CursorShape,
     proxy: EventLoopProxy<UserEvent>,
 ) -> Result<InitialSessions> {
-    if workspace.tabs.is_empty() {
+    if window.tabs.is_empty() {
         anyhow::bail!("workspace has no tabs");
     }
-    let active_tab = workspace.active_tab.min(workspace.tabs.len() - 1);
+    let active_tab = window.active_tab.min(window.tabs.len() - 1);
     let mut restored_tabs = Vec::new();
     let mut maximum_id = 0;
-    for state in workspace.tabs {
+    for state in window.tabs {
         for pane in &state.panes {
             maximum_id = maximum_id.max(pane.id.0);
         }
@@ -2399,5 +3149,13 @@ mod tests {
         assert_eq!(control_byte('1'), None);
         assert_eq!(cursor_sequence(b'A', false), b"\x1b[A");
         assert_eq!(cursor_sequence(b'A', true), b"\x1bOA");
+    }
+
+    #[test]
+    fn contextual_close_prefers_pane_then_tab_then_window() {
+        assert_eq!(close_target(2, 1, 0), CloseTarget::Pane);
+        assert_eq!(close_target(1, 2, 0), CloseTarget::Tab);
+        assert_eq!(close_target(1, 1, 1), CloseTarget::Window);
+        assert_eq!(close_target(1, 1, 0), CloseTarget::Application);
     }
 }

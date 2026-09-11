@@ -31,6 +31,7 @@ unicode-width = "0.2"
 vte = "0.15"
 wgpu = "30.0"
 winit = "0.30"
+muda = "0.17"
 
 [profile.release]
 lto = "thin"

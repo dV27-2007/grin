@@ -7,16 +7,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::layout::{PaneId, PaneTree};
 
-pub const WORKSPACE_VERSION: u32 = 1;
+pub const WORKSPACE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub version: u32,
+    pub theme: String,
+    pub windows: Vec<WindowState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
     pub window_width: u32,
     pub window_height: u32,
     pub active_tab: usize,
-    pub theme: String,
     pub tabs: Vec<TabState>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkspaceV1 {
+    version: u32,
+    window_width: u32,
+    window_height: u32,
+    active_tab: usize,
+    theme: String,
+    tabs: Vec<TabState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -61,21 +76,54 @@ impl Workspace {
                 };
             }
         };
-        match toml::from_str::<Self>(&contents) {
-            Ok(mut workspace) if workspace.version == WORKSPACE_VERSION => {
+        let version = match toml::from_str::<toml::Value>(&contents)
+            .ok()
+            .and_then(|value| value.get("version")?.as_integer())
+        {
+            Some(version) if version >= 0 => version as u32,
+            _ => {
+                return WorkspaceLoad {
+                    workspace: None,
+                    diagnostic: Some(format!(
+                        "workspace {} is corrupt: missing valid version; starting fresh",
+                        path.display()
+                    )),
+                };
+            }
+        };
+        let parsed = match version {
+            1 => toml::from_str::<WorkspaceV1>(&contents).map(|old| {
+                debug_assert_eq!(old.version, 1);
+                Workspace {
+                    version: WORKSPACE_VERSION,
+                    theme: old.theme,
+                    windows: vec![WindowState {
+                        window_width: old.window_width,
+                        window_height: old.window_height,
+                        active_tab: old.active_tab,
+                        tabs: old.tabs,
+                    }],
+                }
+            }),
+            WORKSPACE_VERSION => toml::from_str::<Self>(&contents),
+            _ => {
+                return WorkspaceLoad {
+                    workspace: None,
+                    diagnostic: Some(format!(
+                        "workspace version {version} is unsupported; starting fresh"
+                    )),
+                };
+            }
+        };
+        match parsed {
+            Ok(mut workspace) => {
                 workspace.sanitize();
                 WorkspaceLoad {
                     workspace: Some(workspace),
-                    diagnostic: None,
+                    diagnostic: (version == 1)
+                        .then(|| "migrated single-window workspace version 1".into()),
                 }
             }
-            Ok(workspace) => WorkspaceLoad {
-                workspace: None,
-                diagnostic: Some(format!(
-                    "workspace version {} is unsupported; starting fresh",
-                    workspace.version
-                )),
-            },
             Err(error) => WorkspaceLoad {
                 workspace: None,
                 diagnostic: Some(format!(
@@ -98,26 +146,25 @@ impl Workspace {
     }
 
     fn sanitize(&mut self) {
-        self.window_width = self.window_width.clamp(320, 7680);
-        self.window_height = self.window_height.clamp(180, 4320);
-        if self.tabs.is_empty() {
-            self.active_tab = 0;
-            return;
-        }
-        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        for tab in &mut self.tabs {
-            tab.panes.retain(|pane| tab.root.contains(pane.id));
-            for pane in &mut tab.panes {
-                if !pane.working_directory.is_dir() {
-                    pane.working_directory.clone_from(&fallback);
+        self.windows.retain(|window| !window.tabs.is_empty());
+        for window in &mut self.windows {
+            window.window_width = window.window_width.clamp(320, 7680);
+            window.window_height = window.window_height.clamp(180, 4320);
+            window.active_tab = window.active_tab.min(window.tabs.len() - 1);
+            for tab in &mut window.tabs {
+                tab.panes.retain(|pane| tab.root.contains(pane.id));
+                for pane in &mut tab.panes {
+                    if !pane.working_directory.is_dir() {
+                        pane.working_directory.clone_from(&fallback);
+                    }
                 }
-            }
-            if !tab.root.contains(tab.focused_pane) {
-                tab.focused_pane = tab.root.panes()[0];
-            }
-            if tab.zoomed_pane.is_some_and(|pane| !tab.root.contains(pane)) {
-                tab.zoomed_pane = None;
+                if !tab.root.contains(tab.focused_pane) {
+                    tab.focused_pane = tab.root.panes()[0];
+                }
+                if tab.zoomed_pane.is_some_and(|pane| !tab.root.contains(pane)) {
+                    tab.zoomed_pane = None;
+                }
             }
         }
     }
@@ -130,19 +177,21 @@ mod tests {
     fn sample_workspace() -> Workspace {
         Workspace {
             version: WORKSPACE_VERSION,
-            window_width: 960,
-            window_height: 600,
-            active_tab: 0,
             theme: "dark".into(),
-            tabs: vec![TabState {
-                title: "one".into(),
-                pinned: false,
-                root: PaneTree::leaf(PaneId(1)),
-                focused_pane: PaneId(1),
-                zoomed_pane: None,
-                panes: vec![PaneState {
-                    id: PaneId(1),
-                    working_directory: std::env::current_dir().unwrap(),
+            windows: vec![WindowState {
+                window_width: 960,
+                window_height: 600,
+                active_tab: 0,
+                tabs: vec![TabState {
+                    title: "one".into(),
+                    pinned: false,
+                    root: PaneTree::leaf(PaneId(1)),
+                    focused_pane: PaneId(1),
+                    zoomed_pane: None,
+                    panes: vec![PaneState {
+                        id: PaneId(1),
+                        working_directory: std::env::current_dir().unwrap(),
+                    }],
                 }],
             }],
         }
@@ -179,11 +228,70 @@ mod tests {
     fn missing_directories_are_replaced() {
         let path = test_path("missing-dir");
         let mut workspace = sample_workspace();
-        workspace.tabs[0].panes[0].working_directory =
+        workspace.windows[0].tabs[0].panes[0].working_directory =
             PathBuf::from("/definitely/missing/grin-path");
         workspace.save_atomic(&path).unwrap();
         let restored = Workspace::load(&path).workspace.unwrap();
-        assert!(restored.tabs[0].panes[0].working_directory.is_dir());
+        assert!(
+            restored.windows[0].tabs[0].panes[0]
+                .working_directory
+                .is_dir()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn multi_window_round_trip_preserves_active_tabs_and_pane_state() {
+        let path = test_path("multi-window");
+        let mut workspace = sample_workspace();
+        let mut second = workspace.windows[0].clone();
+        second.window_width = 1280;
+        second.active_tab = 1;
+        let mut second_tab = second.tabs[0].clone();
+        second_tab.title = "two".into();
+        second_tab.pinned = true;
+        second_tab.root = PaneTree::leaf(PaneId(2));
+        assert!(
+            second_tab
+                .root
+                .split(PaneId(2), PaneId(3), crate::layout::SplitAxis::Vertical)
+        );
+        second_tab.focused_pane = PaneId(3);
+        second_tab.zoomed_pane = Some(PaneId(3));
+        second_tab.panes = vec![
+            PaneState {
+                id: PaneId(2),
+                working_directory: std::env::current_dir().unwrap(),
+            },
+            PaneState {
+                id: PaneId(3),
+                working_directory: std::env::current_dir().unwrap(),
+            },
+        ];
+        second.tabs.push(second_tab);
+        workspace.windows.push(second);
+        workspace.save_atomic(&path).unwrap();
+        assert_eq!(Workspace::load(&path).workspace, Some(workspace));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_one_workspace_migrates_to_one_window() {
+        let path = test_path("v1");
+        let current = sample_workspace();
+        let window = &current.windows[0];
+        let old = WorkspaceV1 {
+            version: 1,
+            window_width: window.window_width,
+            window_height: window.window_height,
+            active_tab: window.active_tab,
+            theme: current.theme.clone(),
+            tabs: window.tabs.clone(),
+        };
+        fs::write(&path, toml::to_string(&old).unwrap()).unwrap();
+        let loaded = Workspace::load(&path);
+        assert_eq!(loaded.workspace.unwrap().windows, current.windows);
+        assert!(loaded.diagnostic.unwrap().contains("migrated"));
         let _ = fs::remove_file(path);
     }
 }

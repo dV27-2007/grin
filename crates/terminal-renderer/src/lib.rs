@@ -23,8 +23,17 @@ pub const CELL_WIDTH: f64 = 9.0;
 pub const CELL_HEIGHT: f64 = 18.0;
 pub const TAB_BAR_HEIGHT: f64 = 32.0;
 pub const MIN_TAB_WIDTH: f64 = 120.0;
+const DETACHED_TAB_PREFERRED_WIDTH: f32 = 240.0;
+const DETACHED_TAB_MIN_WIDTH: f32 = 160.0;
+const DETACHED_TAB_MAX_WIDTH: f32 = 320.0;
+const TAB_DROP_DURATION: std::time::Duration = std::time::Duration::from_millis(140);
 pub const NEW_TAB_WIDTH: f64 = 36.0;
 pub const PANE_BORDER_WIDTH: f64 = 1.0;
+const TAB_CLOSE_WIDTH: f32 = 24.0;
+const TAB_CLOSE_RIGHT_INSET: f32 = 4.0;
+const TAB_BUTTON_VERTICAL_INSET: f32 = 4.0;
+const NEW_TAB_VERTICAL_INSET: f32 = 2.0;
+const TAB_TITLE_LEFT_PADDING: f32 = 10.0;
 const REQUESTED_FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT_SCALE: f32 = 1.08;
 const PADDING: f64 = 8.0;
@@ -105,6 +114,32 @@ impl ViewportRect {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LogicalRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl LogicalRect {
+    fn contains(self, x: f64, y: f64) -> bool {
+        x >= f64::from(self.x)
+            && y >= f64::from(self.y)
+            && x < f64::from(self.x + self.width)
+            && y < f64::from(self.y + self.height)
+    }
+
+    fn physical(self, scale: f32) -> ViewportRect {
+        ViewportRect {
+            x: self.x * scale,
+            y: self.y * scale,
+            width: self.width * scale,
+            height: self.height * scale,
+        }
+    }
+}
+
 pub struct PaneView<'a> {
     pub id: u64,
     pub screen: &'a Screen,
@@ -116,6 +151,59 @@ pub struct PaneView<'a> {
 pub struct TabLabel {
     pub title: String,
     pub active: bool,
+}
+
+pub struct CommandPaletteRow<'a> {
+    pub title: &'a str,
+    pub category: &'a str,
+    pub shortcut: String,
+}
+#[derive(Clone, Debug)]
+pub struct PaletteLayout {
+    pub outer: ViewportRect,
+    pub input: ViewportRect,
+    pub results: ViewportRect,
+    pub footer: ViewportRect,
+    pub rows: Vec<ViewportRect>,
+}
+pub struct CommandPaletteView<'a> {
+    pub query: &'a str,
+    pub rows: &'a [CommandPaletteRow<'a>],
+    pub selected: usize,
+    pub scroll_offset: usize,
+    pub layout: &'a PaletteLayout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TabDragVisual {
+    source: usize,
+    target: usize,
+    x: f32,
+    y: f32,
+    outside_tab_bar: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum HoverTarget {
+    #[default]
+    None,
+    Tab(usize),
+    TabClose(usize),
+    NewTab,
+    DraggedTab,
+    PaneDivider {
+        x: f32,
+        y: f32,
+        vertical: bool,
+        active: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TabDropAnimation {
+    index: usize,
+    from_x: f32,
+    started_at: Instant,
 }
 
 #[derive(Debug, Error)]
@@ -197,10 +285,17 @@ pub struct Renderer {
     text_renderer: TextRenderer,
     pane_buffers: HashMap<u64, PaneBuffers>,
     ui_buffers: Vec<Buffer>,
+    palette_buffers: Vec<Buffer>,
     ui_signature: u64,
+    palette_signature: u64,
     layout_signature: u64,
     layout_dirty: bool,
     tab_scroll: f64,
+    tab_drag: Option<TabDragVisual>,
+    tab_drop: Option<TabDropAnimation>,
+    hover: HoverTarget,
+    tab_drag_dirty: bool,
+    interaction_dirty: bool,
     profile_render: bool,
     font_layout: FontLayout,
     options: RenderOptions,
@@ -373,10 +468,17 @@ impl Renderer {
             text_renderer,
             pane_buffers: HashMap::new(),
             ui_buffers: Vec::new(),
+            palette_buffers: Vec::new(),
             ui_signature: 0,
+            palette_signature: 0,
             layout_signature: 0,
             layout_dirty: true,
             tab_scroll: 0.0,
+            tab_drag: None,
+            tab_drop: None,
+            hover: HoverTarget::None,
+            tab_drag_dirty: false,
+            interaction_dirty: false,
             profile_render: std::env::var_os("GRIN_PROFILE_RENDER").is_some(),
             font_layout,
             options,
@@ -432,6 +534,11 @@ impl Renderer {
         position.y >= 0.0 && position.y < TAB_BAR_HEIGHT * self.scale_factor
     }
 
+    pub fn tab_rect(&self, index: usize, count: usize) -> Option<ViewportRect> {
+        self.tab_logical_rect(index, count)
+            .map(|rect| rect.physical(self.scale_factor as f32))
+    }
+
     pub fn tab_at(
         &self,
         position: winit::dpi::PhysicalPosition<f64>,
@@ -465,11 +572,8 @@ impl Renderer {
 
         let scale = self.scale_factor.max(1.0);
         let x = position.x / scale;
-
-        let start = self.tab_strip_width();
-        let end = self.logical_width();
-
-        x >= start && x < end
+        let y = position.y / scale;
+        self.new_tab_logical_rect().contains(x, y)
     }
 
     pub fn tab_close_at(
@@ -484,18 +588,9 @@ impl Renderer {
 
         let scale = self.scale_factor.max(1.0);
         let x = position.x / scale;
-        let strip_width = self.tab_strip_width();
-
-        if x < 0.0 || x >= strip_width {
-            return false;
-        }
-
-        let tab_width = self.tab_width(count);
-        let scroll = self.effective_tab_scroll(count);
-
-        let right = (index + 1) as f64 * tab_width - scroll;
-
-        x >= right - 30.0 && x < right
+        let y = position.y / scale;
+        self.tab_close_logical_rect(index, count)
+            .is_some_and(|rect| rect.contains(x, y))
     }
 
     pub fn scroll_tabs(&mut self, delta: f64, count: usize) -> bool {
@@ -546,8 +641,102 @@ impl Renderer {
         true
     }
 
+    pub fn set_tab_drag_visual(
+        &mut self,
+        source: usize,
+        target: usize,
+        position: winit::dpi::PhysicalPosition<f64>,
+        grab_offset_x: f64,
+    ) {
+        self.tab_drop = None;
+        let scale = self.scale_factor.max(1.0) as f32;
+        let bar_height = TAB_BAR_HEIGHT as f32 * scale;
+
+        let x = position.x as f32 - grab_offset_x as f32;
+
+        // Пока мышка внутри tab bar, tab слегка "поднят".
+        // Если мышка уходит вниз — ghost следует за ней.
+        let outside_tab_bar = !(position.y >= 0.0 && position.y < f64::from(bar_height));
+        let y = if outside_tab_bar {
+            position.y as f32 - bar_height / 2.0
+        } else {
+            2.0 * scale
+        };
+
+        let next = Some(TabDragVisual {
+            source,
+            target,
+            x,
+            y,
+            outside_tab_bar,
+        });
+
+        if self.tab_drag != next {
+            self.tab_drag = next;
+            self.tab_drag_dirty = true;
+        }
+    }
+
+    pub fn clear_tab_drag_visual(&mut self) {
+        if self.tab_drag.take().is_some() {
+            self.tab_drag_dirty = true;
+        }
+    }
+
+    pub fn complete_tab_drag(&mut self, index: usize) {
+        if let Some(drag) = self.tab_drag.take() {
+            self.tab_drop = Some(TabDropAnimation {
+                index,
+                from_x: drag.x,
+                started_at: Instant::now(),
+            });
+            self.tab_drag_dirty = true;
+        }
+    }
+
+    pub fn set_hover(&mut self, hover: HoverTarget) -> bool {
+        if self.hover == hover {
+            return false;
+        }
+        self.hover = hover;
+        self.interaction_dirty = true;
+        true
+    }
+
     fn logical_width(&self) -> f64 {
         self.size.width as f64 / self.scale_factor.max(1.0)
+    }
+
+    fn tab_logical_rect(&self, index: usize, count: usize) -> Option<LogicalRect> {
+        if index >= count {
+            return None;
+        }
+        let tab_width = self.tab_width(count) as f32;
+        let scroll = self.effective_tab_scroll(count) as f32;
+        Some(LogicalRect {
+            x: index as f32 * tab_width - scroll,
+            y: 0.0,
+            width: tab_width,
+            height: TAB_BAR_HEIGHT as f32,
+        })
+    }
+
+    fn tab_close_logical_rect(&self, index: usize, count: usize) -> Option<LogicalRect> {
+        self.tab_logical_rect(index, count).map(tab_close_rect)
+    }
+
+    fn new_tab_logical_rect(&self) -> LogicalRect {
+        new_tab_rect(self.tab_strip_width() as f32)
+    }
+
+    fn button_glyph_position(&self, rect: ViewportRect) -> (f32, f32) {
+        let scale = self.scale_factor as f32;
+        let glyph_width = self.font_layout.cell_width as f32 * scale;
+        let glyph_height = self.font_layout.cell_height as f32 * scale;
+        (
+            rect.x + (rect.width - glyph_width) / 2.0,
+            rect.y + (rect.height - glyph_height) / 2.0,
+        )
     }
 
     fn tab_strip_width(&self) -> f64 {
@@ -618,6 +807,9 @@ impl Renderer {
             for buffer in &mut self.ui_buffers {
                 buffer.set_metrics(metrics);
             }
+            for buffer in &mut self.palette_buffers {
+                buffer.set_metrics(metrics);
+            }
         }
         self.layout_dirty = true;
         debug_metrics(size, scale_factor, &self.font_layout);
@@ -632,18 +824,68 @@ impl Renderer {
                 focused: true,
             }],
             &[],
+            None,
         )
+    }
+
+    pub fn command_palette_layout(&self, row_count: usize) -> PaletteLayout {
+        let scale = self.scale_factor as f32;
+        let logical_width = self.logical_width() as f32;
+        let width = logical_width
+            .clamp(320.0, 640.0)
+            .min((logical_width - 24.0).max(1.0));
+        let outer = LogicalRect {
+            x: ((logical_width - width) / 2.0).max(0.0),
+            y: TAB_BAR_HEIGHT as f32 + 20.0,
+            width,
+            height: (96.0 + row_count.min(9) as f32 * 28.0).max(130.0),
+        }
+        .physical(scale);
+        let input = ViewportRect {
+            x: outer.x + 10.0 * scale,
+            y: outer.y + 8.0 * scale,
+            width: (outer.width - 20.0 * scale).max(1.0),
+            height: 32.0 * scale,
+        };
+        let footer = ViewportRect {
+            x: input.x,
+            y: outer.y + outer.height - 44.0 * scale,
+            width: input.width,
+            height: 36.0 * scale,
+        };
+        let results = ViewportRect {
+            x: input.x,
+            y: input.y + input.height + 4.0 * scale,
+            width: input.width,
+            height: (footer.y - (input.y + input.height + 4.0 * scale)).max(1.0),
+        };
+        let rows = (0..row_count.min(9))
+            .map(|index| ViewportRect {
+                x: results.x,
+                y: results.y + index as f32 * 28.0 * scale,
+                width: results.width,
+                height: 28.0 * scale,
+            })
+            .collect();
+        PaletteLayout {
+            outer,
+            input,
+            results,
+            footer,
+            rows,
+        }
     }
 
     pub fn render_panes(
         &mut self,
         panes: &[PaneView<'_>],
         tabs: &[TabLabel],
+        palette: Option<&CommandPaletteView<'_>>,
     ) -> Result<(), RendererError> {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(());
         }
-        self.prepare_content(panes, tabs)?;
+        self.prepare_content(panes, tabs, palette)?;
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -700,6 +942,9 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         self.atlas.trim();
+        if self.tab_drop.is_some() {
+            self.window.request_redraw();
+        }
         Ok(())
     }
 
@@ -707,18 +952,32 @@ impl Renderer {
         &mut self,
         panes: &[PaneView<'_>],
         tabs: &[TabLabel],
+        palette: Option<&CommandPaletteView<'_>>,
     ) -> Result<(), RendererError> {
+        if self
+            .tab_drop
+            .is_some_and(|drop| drop.started_at.elapsed() >= TAB_DROP_DURATION)
+        {
+            self.tab_drop = None;
+            self.tab_drag_dirty = true;
+        }
+        let animating_drop = self.tab_drop.is_some();
         let layout_signature = pane_layout_signature(panes);
         let ui_signature = tab_signature(tabs);
+        let palette_signature = command_palette_signature(palette);
         let content_changed = panes.iter().any(|pane| {
             self.pane_buffers
                 .get(&pane.id)
                 .is_none_or(|buffers| buffers.prepared_generation != pane.screen.generation())
         });
         if !self.layout_dirty
+            && !self.tab_drag_dirty
+            && !self.interaction_dirty
+            && !animating_drop
             && !content_changed
             && self.layout_signature == layout_signature
             && self.ui_signature == ui_signature
+            && self.palette_signature == palette_signature
         {
             return Ok(());
         }
@@ -726,10 +985,13 @@ impl Renderer {
         let profile_started_at = Instant::now();
         let mut dirty_rows = 0;
         self.rect_scratch.clear();
-        self.build_chrome_rectangles(tabs);
+        // Сначала terminal panes.
         for pane in panes {
             self.build_pane_rectangles(pane);
         }
+        // Потом UI chrome.
+        // Это важно: floating tab должен рисоваться ПОВЕРХ terminal background.
+        self.build_chrome_rectangles(tabs, palette);
         self.ensure_rect_capacity(self.rect_scratch.len());
         if !self.rect_scratch.is_empty() {
             self.queue.write_buffer(
@@ -835,12 +1097,16 @@ impl Renderer {
         }
 
         let tab_width = self.tab_width(tabs.len()) as f32;
-        if self.layout_dirty || self.ui_signature != ui_signature {
+        if self.layout_dirty || self.interaction_dirty || self.ui_signature != ui_signature {
             self.prepare_ui_buffers(tabs, metrics, tab_width);
         }
+        self.prepare_palette_buffers(palette, metrics);
         self.layout_signature = layout_signature;
         self.ui_signature = ui_signature;
+        self.palette_signature = palette_signature;
         self.layout_dirty = false;
+        self.tab_drag_dirty = false;
+        self.interaction_dirty = false;
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -860,62 +1126,119 @@ impl Renderer {
 
         let tab_scroll = self.effective_tab_scroll(tabs.len()) as f32;
 
-        let logical_width = self.logical_width() as f32;
+        let tab_drag_width = self.tab_drag_width(tab_width);
+        let tab_drag = self.tab_drag;
+        let tab_drop = self.tab_drop_position(tab_width, tab_scroll);
 
-        let ui_areas = self
-            .ui_buffers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, buffer)| {
-                if index < tabs.len() {
-                    let tab_left = index as f32 * tab_width - tab_scroll;
-
-                    let tab_right = tab_left + tab_width;
-
-                    let visible_left = tab_left.max(0.0);
-
-                    let visible_right = tab_right.min(tab_strip_width);
-
-                    if visible_right <= visible_left {
-                        return None;
+        let mut ui_areas = Vec::with_capacity(self.ui_buffers.len());
+        for (buffer_index, buffer) in self.ui_buffers.iter().enumerate() {
+            if buffer_index < tabs.len() * 2 {
+                let index = buffer_index / 2;
+                let is_close = buffer_index % 2 == 1;
+                if let Some(drag) = tab_drag.filter(|drag| drag.source == index) {
+                    let tab = LogicalRect {
+                        x: drag.x / scale,
+                        y: drag.y / scale,
+                        width: tab_drag_width,
+                        height: TAB_BAR_HEIGHT as f32,
+                    };
+                    let rect = if is_close {
+                        tab_close_rect(tab)
+                    } else {
+                        tab_title_rect(tab)
                     }
-
-                    let left = (tab_left + 10.0) * scale;
-
-                    Some(TextArea {
+                    .physical(scale);
+                    let (left, top) = if is_close {
+                        self.button_glyph_position(rect)
+                    } else {
+                        (rect.x, rect.y + (rect.height - row_height) / 2.0)
+                    };
+                    ui_areas.push(TextArea {
                         buffer,
                         left,
-                        top: 6.0 * scale,
-                        scale: 1.0,
-                        bounds: TextBounds {
-                            left: (visible_left * scale).ceil() as i32,
-                            top: 0,
-                            right: (visible_right * scale).floor() as i32,
-                            bottom: (TAB_BAR_HEIGHT as f32 * scale) as i32,
-                        },
+                        top,
+                        scale: 1.02,
+                        bounds: text_bounds(rect),
                         default_color: glyph_color(foreground),
                         custom_glyphs: &[],
-                    })
-                } else {
-                    // "+" всегда фиксирован справа и не scroll'ится.
-                    let left = (tab_strip_width + 11.0) * scale;
-
-                    Some(TextArea {
-                        buffer,
-                        left,
-                        top: 6.0 * scale,
-                        scale: 1.0,
-                        bounds: TextBounds {
-                            left: (tab_strip_width * scale).ceil() as i32,
-                            top: 0,
-                            right: (logical_width * scale).floor() as i32,
-                            bottom: (TAB_BAR_HEIGHT as f32 * scale) as i32,
-                        },
-                        default_color: glyph_color(foreground),
-                        custom_glyphs: &[],
-                    })
+                    });
+                    continue;
                 }
-            });
+
+                let display_index = tab_preview_index(index, tab_drag);
+                let tab_left = tab_drop
+                    .filter(|(drop_index, _)| *drop_index == index)
+                    .map_or(display_index as f32 * tab_width - tab_scroll, |(_, x)| x);
+                let tab = LogicalRect {
+                    x: tab_left,
+                    y: 0.0,
+                    width: tab_width,
+                    height: TAB_BAR_HEIGHT as f32,
+                };
+                let rect = if is_close {
+                    tab_close_rect(tab)
+                } else {
+                    tab_title_rect(tab)
+                }
+                .physical(scale);
+                if rect.x + rect.width <= 0.0 || rect.x >= tab_strip_width * scale {
+                    continue;
+                }
+                let (left, top) = if is_close {
+                    self.button_glyph_position(rect)
+                } else {
+                    (rect.x, rect.y + (rect.height - row_height) / 2.0)
+                };
+                ui_areas.push(TextArea {
+                    buffer,
+                    left,
+                    top,
+                    scale: 1.0,
+                    bounds: text_bounds(rect),
+                    default_color: glyph_color(foreground),
+                    custom_glyphs: &[],
+                });
+            } else {
+                // "+" всегда фиксирован справа и не scroll'ится.
+                let rect = self.new_tab_logical_rect().physical(scale);
+                let (left, top) = self.button_glyph_position(rect);
+                ui_areas.push(TextArea {
+                    buffer,
+                    left,
+                    top,
+                    scale: 1.0,
+                    bounds: text_bounds(rect),
+                    default_color: glyph_color(foreground),
+                    custom_glyphs: &[],
+                });
+            }
+        }
+        if let Some(palette) = palette {
+            for (index, buffer) in self.palette_buffers.iter().enumerate() {
+                let text_rect = if index == 0 {
+                    palette.layout.input
+                } else if index <= palette.layout.rows.len() {
+                    palette.layout.rows[index - 1]
+                } else {
+                    palette.layout.footer
+                };
+                ui_areas.push(TextArea {
+                    buffer,
+                    left: text_rect.x + 8.0 * scale,
+                    top: text_rect.y
+                        + if index + 1 == self.palette_buffers.len() {
+                            9.0 * scale
+                        } else {
+                            5.0 * scale
+                        },
+                    scale: 1.0,
+                    bounds: text_bounds(text_rect),
+                    default_color: glyph_color(foreground),
+                    custom_glyphs: &[],
+                });
+            }
+        }
+        let palette_rect = palette.map(|palette| palette.layout.outer);
         let pane_buffers = &self.pane_buffers;
         let pane_areas = panes.iter().flat_map(move |pane| {
             pane_buffers
@@ -927,19 +1250,29 @@ impl Renderer {
                         .iter()
                         .enumerate()
                         .flat_map(move |(row, row_buffers)| {
-                            row_buffers.segments.iter().map(move |segment| TextArea {
-                                buffer: &segment.buffer,
-                                left: pane.rect.x + padding + segment.column as f32 * cell_width,
-                                top: pane.rect.y + padding + row as f32 * row_height,
-                                scale: 1.0,
-                                bounds: TextBounds {
-                                    left: pane.rect.x.ceil() as i32,
-                                    top: pane.rect.y.ceil() as i32,
-                                    right: (pane.rect.x + pane.rect.width).floor() as i32,
-                                    bottom: (pane.rect.y + pane.rect.height).floor() as i32,
-                                },
-                                default_color: glyph_color(foreground),
-                                custom_glyphs: &[],
+                            row_buffers.segments.iter().filter_map(move |segment| {
+                                let top = pane.rect.y + padding + row as f32 * row_height;
+                                if palette_rect.is_some_and(|rect| {
+                                    top < rect.y + rect.height && top + row_height > rect.y
+                                }) {
+                                    return None;
+                                }
+                                Some(TextArea {
+                                    buffer: &segment.buffer,
+                                    left: pane.rect.x
+                                        + padding
+                                        + segment.column as f32 * cell_width,
+                                    top,
+                                    scale: 1.0,
+                                    bounds: TextBounds {
+                                        left: pane.rect.x.ceil() as i32,
+                                        top: pane.rect.y.ceil() as i32,
+                                        right: (pane.rect.x + pane.rect.width).floor() as i32,
+                                        bottom: (pane.rect.y + pane.rect.height).floor() as i32,
+                                    },
+                                    default_color: glyph_color(foreground),
+                                    custom_glyphs: &[],
+                                })
                             })
                         })
                 })
@@ -950,7 +1283,7 @@ impl Renderer {
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            ui_areas.chain(pane_areas),
+            pane_areas.chain(ui_areas),
             &mut self.swash_cache,
         )?;
 
@@ -971,32 +1304,55 @@ impl Renderer {
     }
 
     fn prepare_ui_buffers(&mut self, tabs: &[TabLabel], metrics: Metrics, tab_width: f32) {
-        self.ui_buffers.truncate(tabs.len() + 1);
-        while self.ui_buffers.len() < tabs.len() + 1 {
+        let buffer_count = tabs.len() * 2 + 1;
+        self.ui_buffers.truncate(buffer_count);
+        while self.ui_buffers.len() < buffer_count {
             let mut buffer = Buffer::new(&mut self.font_system, metrics);
             buffer.set_wrap(Wrap::None);
             self.ui_buffers.push(buffer);
         }
         for (index, tab) in tabs.iter().enumerate() {
-            let available = ((tab_width - 16.0).max(0.0) / self.font_layout.cell_width as f32)
+            let title_width_pixels =
+                tab_width - TAB_TITLE_LEFT_PADDING - TAB_CLOSE_RIGHT_INSET - TAB_CLOSE_WIDTH;
+            let available = (title_width_pixels.max(0.0) / self.font_layout.cell_width as f32)
                 .floor()
-                .max(5.0) as usize;
-            let title_width = available.saturating_sub(3);
+                .max(1.0) as usize;
+            let title_width = available.saturating_sub(1);
             let title = truncate_title(&tab.title, title_width);
-            let color = if tab.active {
+            let title_color = if tab.active {
                 self.options.theme.foreground
             } else {
                 muted(self.options.theme.foreground, self.options.theme.tab_bar)
             };
-            self.ui_buffers[index].set_text(
-                &format!("{title:<title_width$} ×"),
+            let close_color = if self.hover == HoverTarget::TabClose(index) {
+                self.options.theme.foreground
+            } else {
+                mix_color(title_color, self.options.theme.tab_bar, 0.12)
+            };
+            let title = format!("{title:<title_width$} ");
+            let default_attrs = Attrs::new().family(Family::Monospace);
+            let title_buffer = index * 2;
+            self.ui_buffers[title_buffer].set_text(
+                &title,
                 &Attrs::new()
                     .family(Family::Monospace)
-                    .color(glyph_color(color)),
+                    .color(glyph_color(title_color)),
                 Shaping::Advanced,
                 None,
             );
-            self.ui_buffers[index].shape_until_scroll(&mut self.font_system, false);
+            self.ui_buffers[title_buffer].shape_until_scroll(&mut self.font_system, false);
+            self.ui_buffers[title_buffer + 1].set_rich_text(
+                [(
+                    "×",
+                    Attrs::new()
+                        .family(Family::Monospace)
+                        .color(glyph_color(close_color)),
+                )],
+                &default_attrs,
+                Shaping::Advanced,
+                None,
+            );
+            self.ui_buffers[title_buffer + 1].shape_until_scroll(&mut self.font_system, false);
         }
         let plus = self.ui_buffers.last_mut().expect("new-tab buffer exists");
         plus.set_text(
@@ -1010,7 +1366,68 @@ impl Renderer {
         plus.shape_until_scroll(&mut self.font_system, false);
     }
 
-    fn build_chrome_rectangles(&mut self, tabs: &[TabLabel]) {
+    fn prepare_palette_buffers(
+        &mut self,
+        palette: Option<&CommandPaletteView<'_>>,
+        metrics: Metrics,
+    ) {
+        let Some(palette) = palette else {
+            self.palette_buffers.clear();
+            return;
+        };
+        let count = palette.rows.len().min(9).max(1) + 2;
+        self.palette_buffers.truncate(count);
+        while self.palette_buffers.len() < count {
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            buffer.set_wrap(Wrap::None);
+            self.palette_buffers.push(buffer);
+        }
+        let attrs = Attrs::new()
+            .family(Family::Monospace)
+            .color(glyph_color(self.options.theme.foreground));
+        self.palette_buffers[0].set_text(
+            &format!("> {}", palette.query),
+            &attrs,
+            Shaping::Advanced,
+            None,
+        );
+        self.palette_buffers[0].shape_until_scroll(&mut self.font_system, false);
+        if palette.rows.is_empty() {
+            self.palette_buffers[1].set_text(
+                "No matching commands",
+                &attrs,
+                Shaping::Advanced,
+                None,
+            );
+            self.palette_buffers[1].shape_until_scroll(&mut self.font_system, false);
+        }
+        for (index, row) in palette.rows.iter().take(9).enumerate() {
+            let text = if row.shortcut.is_empty() {
+                format!("{:<28}{:<14}", row.title, row.category)
+            } else {
+                format!("{:<28}{:<14}{}", row.title, row.category, row.shortcut)
+            };
+            self.palette_buffers[index + 1].set_text(&text, &attrs, Shaping::Advanced, None);
+            self.palette_buffers[index + 1].shape_until_scroll(&mut self.font_system, false);
+        }
+        let footer = self
+            .palette_buffers
+            .last_mut()
+            .expect("palette footer exists");
+        footer.set_text(
+            "↑↓ Navigate    Enter Run    Esc Close",
+            &attrs,
+            Shaping::Advanced,
+            None,
+        );
+        footer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    fn build_chrome_rectangles(
+        &mut self,
+        tabs: &[TabLabel],
+        palette: Option<&CommandPaletteView<'_>>,
+    ) {
         let scale = self.scale_factor as f32;
 
         let tab_width = self.tab_width(tabs.len()) as f32;
@@ -1018,9 +1435,19 @@ impl Renderer {
         let tab_scroll = self.effective_tab_scroll(tabs.len()) as f32;
 
         let strip_width = self.tab_strip_width() as f32;
+        let tab_drag = self.tab_drag;
+        let tab_drop = self.tab_drop_position(tab_width, tab_scroll);
 
         for (index, tab) in tabs.iter().enumerate() {
-            let left = index as f32 * tab_width - tab_scroll;
+            let dragging_source = tab_drag.is_some_and(|drag| drag.source == index);
+            if dragging_source && tab_drag.is_some_and(|drag| !drag.outside_tab_bar) {
+                continue;
+            }
+
+            let display_index = tab_preview_index(index, tab_drag);
+            let left = tab_drop
+                .filter(|(drop_index, _)| *drop_index == index)
+                .map_or(display_index as f32 * tab_width - tab_scroll, |(_, x)| x);
 
             let right = left + tab_width;
 
@@ -1031,29 +1458,192 @@ impl Renderer {
                 continue;
             }
 
-            let width = ((visible_right - visible_left) * scale - scale).max(0.0);
-
-            if width <= 0.0 {
-                continue;
-            }
-
             push_rect(
                 &mut self.rect_scratch,
                 ViewportRect {
                     x: visible_left * scale,
                     y: 0.0,
-                    width,
+                    width: ((visible_right - visible_left) * scale - scale).max(0.0),
                     height: TAB_BAR_HEIGHT as f32 * scale,
                 },
-                if tab.active {
+                if dragging_source {
+                    // На старом месте остаётся placeholder.
+                    self.options.theme.tab_bar
+                } else if self.hover == HoverTarget::TabClose(index) {
+                    mix_color(
+                        if tab.active {
+                            self.options.theme.active_tab
+                        } else {
+                            self.options.theme.inactive_tab
+                        },
+                        self.options.theme.foreground,
+                        0.16,
+                    )
+                } else if self.hover == HoverTarget::Tab(index) {
+                    mix_color(
+                        if tab.active {
+                            self.options.theme.active_tab
+                        } else {
+                            self.options.theme.inactive_tab
+                        },
+                        self.options.theme.foreground,
+                        0.08,
+                    )
+                } else if tab.active {
                     self.options.theme.active_tab
                 } else {
                     self.options.theme.inactive_tab
                 },
+                if dragging_source {
+                    self.options.opacity * 0.65
+                } else {
+                    self.options.opacity
+                },
+                self.size,
+            );
+
+            if self.hover == HoverTarget::TabClose(index) {
+                let tab_surface = if tab.active {
+                    self.options.theme.active_tab
+                } else {
+                    self.options.theme.inactive_tab
+                };
+                if let Some(rect) = self.tab_close_logical_rect(index, tabs.len()) {
+                    push_rect(
+                        &mut self.rect_scratch,
+                        rect.physical(scale),
+                        mix_color(tab_surface, self.options.theme.foreground, 0.22),
+                        self.options.opacity,
+                        self.size,
+                    );
+                }
+            }
+        }
+
+        if self.hover == HoverTarget::NewTab {
+            let rect = self.new_tab_logical_rect().physical(scale);
+            push_rect(
+                &mut self.rect_scratch,
+                rect,
+                mix_color(
+                    self.options.theme.tab_bar,
+                    self.options.theme.foreground,
+                    0.14,
+                ),
                 self.options.opacity,
                 self.size,
             );
         }
+
+        if let Some(drag) = tab_drag.filter(|drag| !drag.outside_tab_bar) {
+            let left = drag.target as f32 * tab_width - tab_scroll;
+            push_rect(
+                &mut self.rect_scratch,
+                ViewportRect {
+                    x: left * scale,
+                    y: 3.0 * scale,
+                    width: 2.0 * scale,
+                    height: (TAB_BAR_HEIGHT as f32 - 6.0) * scale,
+                },
+                self.options.theme.foreground,
+                self.options.opacity,
+                self.size,
+            );
+        }
+
+        if let Some(palette) = palette {
+            let rect = palette.layout.outer;
+            push_rect(
+                &mut self.rect_scratch,
+                rect,
+                mix_color(
+                    self.options.theme.tab_bar,
+                    self.options.theme.background,
+                    0.55,
+                ),
+                1.0,
+                self.size,
+            );
+            push_rect(
+                &mut self.rect_scratch,
+                palette.layout.input,
+                mix_color(
+                    self.options.theme.inactive_tab,
+                    self.options.theme.background,
+                    0.35,
+                ),
+                1.0,
+                self.size,
+            );
+            if let Some(row) = palette.layout.rows.get(palette.selected) {
+                push_rect(
+                    &mut self.rect_scratch,
+                    *row,
+                    mix_color(
+                        self.options.theme.active_tab,
+                        self.options.theme.foreground,
+                        0.16,
+                    ),
+                    self.options.opacity,
+                    self.size,
+                );
+            }
+        }
+
+        // Floating/dragged tab.
+        if let Some(drag) = self.tab_drag {
+            let lift_scale = 1.02;
+            let ghost_width = self.tab_drag_width(tab_width) * scale * lift_scale;
+            let ghost_height = (TAB_BAR_HEIGHT as f32 - 4.0) * scale * lift_scale;
+            let ghost_x = drag.x - (ghost_width - self.tab_drag_width(tab_width) * scale) / 2.0;
+            let ghost_y = drag.y - (ghost_height - (TAB_BAR_HEIGHT as f32 - 4.0) * scale) / 2.0;
+
+            // Shadow.
+            push_rect(
+                &mut self.rect_scratch,
+                ViewportRect {
+                    x: ghost_x + 3.0 * scale,
+                    y: ghost_y + 4.0 * scale,
+                    width: ghost_width,
+                    height: ghost_height,
+                },
+                self.options.theme.tab_bar,
+                self.options.opacity * 0.55,
+                self.size,
+            );
+
+            // Сам поднятый tab.
+            push_rect(
+                &mut self.rect_scratch,
+                ViewportRect {
+                    x: ghost_x,
+                    y: ghost_y,
+                    width: ghost_width,
+                    height: ghost_height,
+                },
+                self.options.theme.active_tab,
+                self.options.opacity,
+                self.size,
+            );
+        }
+    }
+
+    fn tab_drag_width(&self, tab_width: f32) -> f32 {
+        if self.tab_drag.is_some_and(|drag| drag.outside_tab_bar) {
+            DETACHED_TAB_PREFERRED_WIDTH.clamp(DETACHED_TAB_MIN_WIDTH, DETACHED_TAB_MAX_WIDTH)
+        } else {
+            tab_width
+        }
+    }
+
+    fn tab_drop_position(&self, tab_width: f32, tab_scroll: f32) -> Option<(usize, f32)> {
+        let drop = self.tab_drop?;
+        let progress = (drop.started_at.elapsed().as_secs_f32() / TAB_DROP_DURATION.as_secs_f32())
+            .clamp(0.0, 1.0);
+        let eased = ease_out_cubic(progress);
+        let destination = drop.index as f32 * tab_width - tab_scroll;
+        let from = drop.from_x / self.scale_factor.max(1.0) as f32;
+        Some((drop.index, from + (destination - from) * eased))
     }
 
     fn build_pane_rectangles(&mut self, pane: &PaneView<'_>) {
@@ -1069,15 +1659,71 @@ impl Renderer {
         // Тонкая граница присутствует у каждого pane.
         // Поэтому соседние panes визуально всегда разделены.
         let border = (PANE_BORDER_WIDTH * self.scale_factor).max(1.0) as f32;
+        let border_color = if pane.focused {
+            mix_color(theme.pane_border, theme.foreground, 0.22)
+        } else {
+            theme.pane_border
+        };
 
         for rect in border_rectangles(pane.rect, border) {
             push_rect(
                 &mut self.rect_scratch,
                 rect,
-                theme.pane_border,
+                border_color,
                 self.options.opacity,
                 self.size,
             );
+        }
+
+        if let HoverTarget::PaneDivider {
+            x,
+            y,
+            vertical,
+            active,
+        } = self.hover
+        {
+            let distance = 7.0 * self.scale_factor as f32;
+            let color = mix_color(
+                theme.pane_border,
+                theme.foreground,
+                if active { 0.65 } else { 0.38 },
+            );
+            let thickness = if active { 2.0 } else { 1.5 } * self.scale_factor as f32;
+            if vertical {
+                for edge in [pane.rect.x, pane.rect.x + pane.rect.width] {
+                    if (edge - x).abs() <= distance {
+                        push_rect(
+                            &mut self.rect_scratch,
+                            ViewportRect {
+                                x: edge - thickness / 2.0,
+                                y: pane.rect.y,
+                                width: thickness,
+                                height: pane.rect.height,
+                            },
+                            color,
+                            self.options.opacity,
+                            self.size,
+                        );
+                    }
+                }
+            } else {
+                for edge in [pane.rect.y, pane.rect.y + pane.rect.height] {
+                    if (edge - y).abs() <= distance {
+                        push_rect(
+                            &mut self.rect_scratch,
+                            ViewportRect {
+                                x: pane.rect.x,
+                                y: edge - thickness / 2.0,
+                                width: pane.rect.width,
+                                height: thickness,
+                            },
+                            color,
+                            self.options.opacity,
+                            self.size,
+                        );
+                    }
+                }
+            }
         }
 
         let width = self.size.width as f32;
@@ -1158,6 +1804,61 @@ impl Renderer {
     }
 }
 
+fn tab_preview_index(index: usize, drag: Option<TabDragVisual>) -> usize {
+    let Some(drag) = drag.filter(|drag| !drag.outside_tab_bar) else {
+        return index;
+    };
+    if drag.source < drag.target && index > drag.source && index <= drag.target {
+        index - 1
+    } else if drag.source > drag.target && index >= drag.target && index < drag.source {
+        index + 1
+    } else {
+        index
+    }
+}
+
+fn tab_close_rect(tab: LogicalRect) -> LogicalRect {
+    LogicalRect {
+        x: tab.x + tab.width - TAB_CLOSE_RIGHT_INSET - TAB_CLOSE_WIDTH,
+        y: tab.y + TAB_BUTTON_VERTICAL_INSET,
+        width: TAB_CLOSE_WIDTH,
+        height: tab.height - TAB_BUTTON_VERTICAL_INSET * 2.0,
+    }
+}
+
+fn tab_title_rect(tab: LogicalRect) -> LogicalRect {
+    let close = tab_close_rect(tab);
+    LogicalRect {
+        x: tab.x + TAB_TITLE_LEFT_PADDING,
+        y: tab.y,
+        width: (close.x - (tab.x + TAB_TITLE_LEFT_PADDING)).max(0.0),
+        height: tab.height,
+    }
+}
+
+fn new_tab_rect(tab_strip_width: f32) -> LogicalRect {
+    LogicalRect {
+        x: tab_strip_width,
+        y: NEW_TAB_VERTICAL_INSET,
+        width: NEW_TAB_WIDTH as f32,
+        height: TAB_BAR_HEIGHT as f32 - NEW_TAB_VERTICAL_INSET * 2.0,
+    }
+}
+
+fn text_bounds(rect: ViewportRect) -> TextBounds {
+    TextBounds {
+        left: rect.x.ceil() as i32,
+        top: rect.y.ceil() as i32,
+        right: (rect.x + rect.width).floor() as i32,
+        bottom: (rect.y + rect.height).floor() as i32,
+    }
+}
+
+fn ease_out_cubic(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    1.0 - (1.0 - progress).powi(3)
+}
+
 pub fn grid_size(size: PhysicalSize<u32>, scale_factor: f64) -> (u16, u16) {
     let columns = ((size.width as f64 - 2.0 * PADDING * scale_factor)
         / (CELL_WIDTH * scale_factor))
@@ -1217,6 +1918,21 @@ fn tab_signature(tabs: &[TabLabel]) -> u64 {
     hasher.finish()
 }
 
+fn command_palette_signature(palette: Option<&CommandPaletteView<'_>>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Some(palette) = palette {
+        palette.query.hash(&mut hasher);
+        palette.selected.hash(&mut hasher);
+        palette.scroll_offset.hash(&mut hasher);
+        for row in palette.rows {
+            row.title.hash(&mut hasher);
+            row.category.hash(&mut hasher);
+            row.shortcut.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 fn truncate_title(title: &str, max_chars: usize) -> String {
     let mut output: String = title.chars().take(max_chars).collect();
     if title.chars().count() > max_chars {
@@ -1232,6 +1948,13 @@ fn muted(foreground: Rgb, background: Rgb) -> Rgb {
         ((u16::from(foreground.g) + u16::from(background.g) * 2) / 3) as u8,
         ((u16::from(foreground.b) + u16::from(background.b) * 2) / 3) as u8,
     )
+}
+
+fn mix_color(from: Rgb, to: Rgb, amount: f32) -> Rgb {
+    let mix = |from: u8, to: u8| {
+        (f32::from(from) + (f32::from(to) - f32::from(from)) * amount.clamp(0.0, 1.0)).round() as u8
+    };
+    Rgb::new(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b))
 }
 
 fn border_rectangles(rect: ViewportRect, width: f32) -> [ViewportRect; 4] {
@@ -1566,6 +2289,97 @@ mod tests {
         assert_eq!(srgb_channel_to_linear(0), 0.0);
         assert_eq!(srgb_channel_to_linear(255), 1.0);
         assert!((srgb_channel_to_linear(128) - 0.21586).abs() < 0.00001);
+    }
+
+    #[test]
+    fn hover_surfaces_remain_distinct_from_foreground_glyphs() {
+        let theme = RenderTheme::default();
+        let close_hover = mix_color(theme.active_tab, theme.foreground, 0.22);
+        let new_tab_hover = mix_color(theme.tab_bar, theme.foreground, 0.14);
+        assert_ne!(close_hover, theme.active_tab);
+        assert_ne!(close_hover, theme.foreground);
+        assert_ne!(new_tab_hover, theme.tab_bar);
+        assert_ne!(new_tab_hover, theme.foreground);
+    }
+
+    #[test]
+    fn tab_control_rectangles_share_logical_tab_bar_geometry() {
+        let tab = LogicalRect {
+            x: 120.0,
+            y: 0.0,
+            width: 160.0,
+            height: TAB_BAR_HEIGHT as f32,
+        };
+        let close = tab_close_rect(tab);
+        let plus = new_tab_rect(764.0);
+
+        assert_eq!(
+            close,
+            LogicalRect {
+                x: 252.0,
+                y: 4.0,
+                width: 24.0,
+                height: 24.0
+            }
+        );
+        assert_eq!(
+            plus,
+            LogicalRect {
+                x: 764.0,
+                y: 2.0,
+                width: 36.0,
+                height: 28.0
+            }
+        );
+        assert!(close.contains(264.0, 16.0));
+        assert!(!close.contains(276.0, 16.0));
+        assert_eq!(
+            close.physical(2.0),
+            ViewportRect {
+                x: 504.0,
+                y: 8.0,
+                width: 48.0,
+                height: 48.0
+            }
+        );
+    }
+
+    #[test]
+    fn tab_drag_preview_shifts_only_tabs_between_source_and_target() {
+        let forward = Some(TabDragVisual {
+            source: 0,
+            target: 2,
+            x: 0.0,
+            y: 0.0,
+            outside_tab_bar: false,
+        });
+        assert_eq!(tab_preview_index(1, forward), 0);
+        assert_eq!(tab_preview_index(2, forward), 1);
+
+        let backward = Some(TabDragVisual {
+            source: 2,
+            target: 0,
+            x: 0.0,
+            y: 0.0,
+            outside_tab_bar: false,
+        });
+        assert_eq!(tab_preview_index(0, backward), 1);
+        assert_eq!(tab_preview_index(1, backward), 2);
+
+        let outside = backward.map(|mut drag| {
+            drag.outside_tab_bar = true;
+            drag
+        });
+        assert_eq!(tab_preview_index(0, outside), 0);
+    }
+
+    #[test]
+    fn tab_drop_easing_is_bounded_and_finishes_exactly() {
+        assert_eq!(ease_out_cubic(-1.0), 0.0);
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert!(ease_out_cubic(0.5) > 0.5);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert_eq!(ease_out_cubic(2.0), 1.0);
     }
 
     #[test]

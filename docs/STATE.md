@@ -11,7 +11,12 @@
 - Text/special/control keyboard input sent to the shell.
 - Mouse selection, native copy/paste, bracketed paste, scrollback wheel/page navigation, latest-match search, OSC titles, OSC 8 hyperlinks, and graceful shell-exit state.
 - Window size mapped to terminal rows/columns and propagated to the PTY.
+- Tabs support pinned grouping, horizontal scrolling, hover feedback, animated drag-reorder previews, a compact lifted drag ghost, and a short event-driven drop snap. Pane trees support focus, directional movement, splits, resizing, swapping, zoom, and focused/hovered divider feedback.
+- Dragging a tab outside its tab bar detaches the existing live tab and PTYs into a second native window. Input, selection, pane interaction, rendering, resize, title updates, and close behavior are routed independently per window.
+- Workspace version 2 persists every native window's size, active tab, tab ordering/pinning, and pane state. Version 1 single-window workspaces migrate in memory and restore as one window.
 - Event loop waits while idle; PTY wake-ups are coalesced and redraw occurs on state change.
+- A per-window command palette provides deterministic local action search and routes execution through the same action dispatcher as keyboard shortcuts.
+- On macOS, a native `muda` application menu forwards menu selections through that same action dispatcher for the focused Grin window.
 - Renderer caches persistent per-row shaping buffers by row signature, trims blank tails, emits sparse background/cursor geometry, and skips preparation on unchanged redraws. Font discovery, atlas/cache, text renderer, GPU buffers, and staging vectors persist.
 - Debug builds print startup diagnostics; release builds expose opt-in `GRIN_PROFILE_STARTUP`, `GRIN_PROFILE_INPUT`, and `GRIN_PROFILE_RENDER` diagnostics.
 - Unit tests cover core parser/grid/scroll/resize/color/Unicode/alternate-screen logic, finite fallback layout, renderer sizing/color conversion, input mapping, and a real shell/PTY round trip.
@@ -37,6 +42,7 @@
 - Horizontal resize truncates/extends rows rather than reflowing wrapped history.
 - Bidirectional and joining-script shaping does not span separate terminal cells; fallback glyph selection/rasterization is supported, but the fixed terminal grid remains authoritative.
 - Search exposes the most recent match only; mouse-reporting protocols and focus reporting are not implemented.
-- There is no persisted font/theme configuration, tab, pane, widget, or plugin system.
+- Window position persistence is deferred; current cross-platform restoration persists safe per-window sizes only.
+- There is no widget or plugin system.
 - Windows/Linux are architectural targets but have not been runtime-tested in this repository.
 - Fresh idle meets the memory target, but a saturated 10,000-line full-cell scrollback exceeds 100 MiB RSS. Cold first-frame time also remains above the 100 ms target.

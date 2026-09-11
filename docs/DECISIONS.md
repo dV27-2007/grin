@@ -23,3 +23,20 @@ Use `glyphon`/`cosmic-text` with a persistent system-font database, Swash cache,
 ## D006 — Row-local render preparation
 
 Cache persistent shaping buffers per visible row and invalidate them with compact row signatures. Changed rows alone are rebuilt and reshaped; trailing blank glyphs and default-background rectangles are omitted. GPU/text resources remain persistent, and unchanged redraws bypass preparation.
+
+## D007 — Per-window app runtime with movable tab sessions
+
+The app owns native windows in a `HashMap<WindowId, WindowSession>` and routes each `WindowEvent` through the matching runtime. A detached tab moves its existing `TabSession` into a newly initialized window, preserving its terminal models and live PTY handles; process, parser, and renderer crates remain unaware of window ownership.
+
+## D008 — Versioned multi-window workspace snapshots
+
+Workspace version 2 stores a list of per-window sizes and tab trees under one global theme. Version 1 is decoded explicitly and migrated to a single `WindowState`; unknown or corrupt versions still fall back safely. Snapshots are written by one coalescing background worker with at most one pending value, keeping filesystem I/O off input/render paths. Window position remains deferred rather than relying on platform-specific placement hacks.
+
+## D009 — Event-driven interaction animation
+
+Hover and drag state invalidate only renderer interaction geometry. The short tab-drop animation chains redraw requests for at most 140 ms, then clears its timestamp and returns to the application's normal `ControlFlow::Wait` idle behavior; there is no timer or permanent frame loop.
+# Command palette dispatch
+
+Keyboard shortcuts and the Command Palette are frontends over the same central `Action` dispatch path. The palette owns only per-window query/selection state; it does not own terminal or PTY behavior.
+
+The macOS native menu uses `muda` and forwards its callbacks through the winit user-event proxy, then activates the tracked focused window before dispatching the same `Action`.

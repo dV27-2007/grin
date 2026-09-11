@@ -17,6 +17,9 @@ terminal-renderer = { path = "../terminal-renderer" }
 toml.workspace = true
 winit.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+muda.workspace = true
+
 [[bin]]
 name = "grin"
 path = "src/main.rs"

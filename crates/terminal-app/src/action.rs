@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Action {
+    ToggleCommandPalette,
     NewTab,
     TogglePinTab,
     Close,
@@ -57,6 +58,7 @@ impl Action {
             .flat_map(char::to_lowercase)
             .collect();
         Some(match normalized.as_str() {
+            "togglecommandpalette" => Self::ToggleCommandPalette,
             "newtab" => Self::NewTab,
             "togglepintab" => Self::TogglePinTab,
             "close" => Self::Close,
@@ -116,6 +118,177 @@ impl Action {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionInfo {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub category: &'static str,
+    pub keywords: &'static str,
+    pub action: Action,
+}
+
+pub fn action_registry() -> &'static [ActionInfo] {
+    &[
+        ActionInfo {
+            id: "terminal.new_tab",
+            title: "New Tab",
+            category: "Terminal",
+            keywords: "new terminal create",
+            action: Action::NewTab,
+        },
+        ActionInfo {
+            id: "terminal.close",
+            title: "Close",
+            category: "Terminal",
+            keywords: "close terminal",
+            action: Action::Close,
+        },
+        ActionInfo {
+            id: "terminal.duplicate_tab",
+            title: "Duplicate Tab",
+            category: "Terminal",
+            keywords: "copy clone terminal",
+            action: Action::DuplicateTab,
+        },
+        ActionInfo {
+            id: "terminal.restore_closed_tab",
+            title: "Restore Closed Tab",
+            category: "Terminal",
+            keywords: "restore reopen undo",
+            action: Action::RestoreTab,
+        },
+        ActionInfo {
+            id: "terminal.rename_tab",
+            title: "Rename Tab",
+            category: "Terminal",
+            keywords: "rename title",
+            action: Action::RenameTab,
+        },
+        ActionInfo {
+            id: "pane.split_right",
+            title: "Split Right",
+            category: "Pane",
+            keywords: "split vertical right",
+            action: Action::SplitVertical,
+        },
+        ActionInfo {
+            id: "pane.split_down",
+            title: "Split Down",
+            category: "Pane",
+            keywords: "split horizontal down",
+            action: Action::SplitHorizontal,
+        },
+        ActionInfo {
+            id: "pane.zoom",
+            title: "Zoom Pane",
+            category: "Pane",
+            keywords: "zoom maximize",
+            action: Action::TogglePaneZoom,
+        },
+        ActionInfo {
+            id: "pane.focus_left",
+            title: "Focus Left",
+            category: "Pane",
+            keywords: "focus pane left",
+            action: Action::FocusLeft,
+        },
+        ActionInfo {
+            id: "pane.focus_right",
+            title: "Focus Right",
+            category: "Pane",
+            keywords: "focus pane right",
+            action: Action::FocusRight,
+        },
+        ActionInfo {
+            id: "pane.focus_up",
+            title: "Focus Up",
+            category: "Pane",
+            keywords: "focus pane up",
+            action: Action::FocusUp,
+        },
+        ActionInfo {
+            id: "pane.focus_down",
+            title: "Focus Down",
+            category: "Pane",
+            keywords: "focus pane down",
+            action: Action::FocusDown,
+        },
+        ActionInfo {
+            id: "pane.swap_left",
+            title: "Swap Left",
+            category: "Pane",
+            keywords: "swap pane left",
+            action: Action::SwapPaneLeft,
+        },
+        ActionInfo {
+            id: "pane.swap_right",
+            title: "Swap Right",
+            category: "Pane",
+            keywords: "swap pane right",
+            action: Action::SwapPaneRight,
+        },
+        ActionInfo {
+            id: "pane.swap_up",
+            title: "Swap Up",
+            category: "Pane",
+            keywords: "swap pane up",
+            action: Action::SwapPaneUp,
+        },
+        ActionInfo {
+            id: "pane.swap_down",
+            title: "Swap Down",
+            category: "Pane",
+            keywords: "swap pane down",
+            action: Action::SwapPaneDown,
+        },
+        ActionInfo {
+            id: "view.search",
+            title: "Search",
+            category: "View",
+            keywords: "find scrollback",
+            action: Action::Search,
+        },
+    ]
+}
+
+pub fn match_actions(query: &str) -> Vec<&'static ActionInfo> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return action_registry().iter().collect();
+    }
+    let mut matches: Vec<_> = action_registry()
+        .iter()
+        .filter_map(|info| {
+            let title = info.title.to_ascii_lowercase();
+            let score = if title == query {
+                Some(0)
+            } else if title.starts_with(&query) {
+                Some(1)
+            } else if title.contains(&query) {
+                Some(2)
+            } else if ordered_subsequence(&title, &query) {
+                Some(3)
+            } else if info.keywords.to_ascii_lowercase().contains(&query) {
+                Some(4)
+            } else if info.category.to_ascii_lowercase().contains(&query) {
+                Some(5)
+            } else {
+                None
+            }?;
+            Some((score, info))
+        })
+        .collect();
+    matches.sort_by_key(|(score, info)| (*score, info.title));
+    matches.into_iter().map(|(_, info)| info).collect()
+}
+
+fn ordered_subsequence(value: &str, query: &str) -> bool {
+    let mut chars = value.chars();
+    query
+        .chars()
+        .all(|needle| chars.by_ref().any(|value| value == needle))
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -204,6 +377,58 @@ impl KeyBindings {
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }
+
+    pub fn shortcut_label(&self, action: Action) -> Option<String> {
+        self.shortcut(action).map(|chord| format_shortcut(&chord))
+    }
+
+    pub fn shortcut(&self, action: Action) -> Option<KeyChord> {
+        let mut chords: Vec<_> = self
+            .bindings
+            .iter()
+            .filter_map(|(chord, bound)| (*bound == action).then_some(chord.clone()))
+            .collect();
+        chords.sort_by_key(|chord| {
+            format!(
+                "{}{}{}{}{}",
+                chord.command, chord.control, chord.alt, chord.shift, chord.key
+            )
+        });
+        chords.into_iter().next()
+    }
+}
+
+pub fn format_shortcut(chord: &KeyChord) -> String {
+    if cfg!(target_os = "macos") {
+        let mut label = String::new();
+        if chord.control {
+            label.push('⌃');
+        }
+        if chord.alt {
+            label.push('⌥');
+        }
+        if chord.shift {
+            label.push('⇧');
+        }
+        if chord.command {
+            label.push('⌘');
+        }
+        label.push_str(&chord.key.to_ascii_uppercase());
+        label
+    } else {
+        let mut parts = Vec::new();
+        if chord.control || chord.command {
+            parts.push("Ctrl");
+        }
+        if chord.alt {
+            parts.push("Alt");
+        }
+        if chord.shift {
+            parts.push("Shift");
+        }
+        parts.push(&chord.key);
+        parts.join("+")
+    }
 }
 
 impl Default for KeyBindings {
@@ -215,6 +440,7 @@ impl Default for KeyBindings {
 fn default_bindings() -> &'static [(&'static str, Action)] {
     &[
         ("cmd+t", Action::NewTab),
+        ("cmd+shift+p", Action::ToggleCommandPalette),
         ("cmd+alt+p", Action::TogglePinTab),
         ("cmd+w", Action::Close),
         ("cmd+shift+w", Action::CloseTab),
@@ -285,5 +511,37 @@ mod tests {
             bindings.action(&KeyChord::parse("cmd+t").unwrap()),
             Some(Action::NewTab)
         );
+    }
+
+    #[test]
+    fn action_matcher_ranks_exact_prefix_substring_fuzzy_and_metadata() {
+        assert_eq!(match_actions("")[0].action, Action::NewTab);
+        assert_eq!(match_actions("NEW TAB")[0].action, Action::NewTab);
+        assert_eq!(match_actions("split r")[0].action, Action::SplitVertical);
+        assert_eq!(match_actions("nt")[0].action, Action::NewTab);
+        assert_eq!(match_actions("restore")[0].action, Action::RestoreTab);
+        assert_eq!(match_actions("terminal")[0].category, "Terminal");
+        assert!(match_actions("not-an-action").is_empty());
+    }
+
+    #[test]
+    fn shortcut_formatter_uses_platform_conventions() {
+        let chord = KeyChord::parse("cmd+alt+shift+t").unwrap();
+        let expected = if cfg!(target_os = "macos") {
+            "⌥⇧⌘T"
+        } else {
+            "Ctrl+Alt+Shift+T"
+        };
+        assert_eq!(format_shortcut(&chord), expected);
+    }
+
+    #[test]
+    fn contextual_close_is_the_only_cmd_w_binding() {
+        let bindings = KeyBindings::default();
+        assert_eq!(
+            bindings.shortcut(Action::Close),
+            Some(KeyChord::parse("cmd+w").unwrap())
+        );
+        assert_eq!(bindings.shortcut(Action::ClosePane), None);
     }
 }
