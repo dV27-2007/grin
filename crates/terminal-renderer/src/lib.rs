@@ -22,7 +22,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 pub const CELL_WIDTH: f64 = 9.0;
 pub const CELL_HEIGHT: f64 = 18.0;
 pub const TAB_BAR_HEIGHT: f64 = 32.0;
-pub const TAB_WIDTH: f64 = 168.0;
+pub const MIN_TAB_WIDTH: f64 = 120.0;
 pub const NEW_TAB_WIDTH: f64 = 36.0;
 pub const PANE_BORDER_WIDTH: f64 = 1.0;
 const REQUESTED_FONT_SIZE: f32 = 14.0;
@@ -200,6 +200,7 @@ pub struct Renderer {
     ui_signature: u64,
     layout_signature: u64,
     layout_dirty: bool,
+    tab_scroll: f64,
     profile_render: bool,
     font_layout: FontLayout,
     options: RenderOptions,
@@ -375,6 +376,7 @@ impl Renderer {
             ui_signature: 0,
             layout_signature: 0,
             layout_dirty: true,
+            tab_scroll: 0.0,
             profile_render: std::env::var_os("GRIN_PROFILE_RENDER").is_some(),
             font_layout,
             options,
@@ -426,26 +428,48 @@ impl Renderer {
         (row, column)
     }
 
+    pub fn tab_bar_at(&self, position: winit::dpi::PhysicalPosition<f64>) -> bool {
+        position.y >= 0.0 && position.y < TAB_BAR_HEIGHT * self.scale_factor
+    }
+
     pub fn tab_at(
         &self,
         position: winit::dpi::PhysicalPosition<f64>,
         count: usize,
     ) -> Option<usize> {
-        let scale = self.scale_factor;
-        if position.y < 0.0 || position.y >= TAB_BAR_HEIGHT * scale {
+        if count == 0 || !self.tab_bar_at(position) {
             return None;
         }
-        let index = (position.x / (self.tab_width(count) * scale)).floor() as usize;
+
+        let scale = self.scale_factor.max(1.0);
+        let x = position.x / scale;
+        let strip_width = self.tab_strip_width();
+
+        // Правая область зарезервирована под "+".
+        if x < 0.0 || x >= strip_width {
+            return None;
+        }
+
+        let tab_width = self.tab_width(count);
+        let scroll = self.effective_tab_scroll(count);
+
+        let index = ((x + scroll) / tab_width).floor() as usize;
+
         (index < count).then_some(index)
     }
 
-    pub fn new_tab_at(&self, position: winit::dpi::PhysicalPosition<f64>, count: usize) -> bool {
-        let scale = self.scale_factor;
-        let start = count as f64 * self.tab_width(count) * scale;
-        position.y >= 0.0
-            && position.y < TAB_BAR_HEIGHT * scale
-            && position.x >= start
-            && position.x < start + NEW_TAB_WIDTH * scale
+    pub fn new_tab_at(&self, position: winit::dpi::PhysicalPosition<f64>, _count: usize) -> bool {
+        if !self.tab_bar_at(position) {
+            return false;
+        }
+
+        let scale = self.scale_factor.max(1.0);
+        let x = position.x / scale;
+
+        let start = self.tab_strip_width();
+        let end = self.logical_width();
+
+        x >= start && x < end
     }
 
     pub fn tab_close_at(
@@ -454,19 +478,104 @@ impl Renderer {
         index: usize,
         count: usize,
     ) -> bool {
-        let scale = self.scale_factor;
-        let right = (index + 1) as f64 * self.tab_width(count) * scale;
-        position.x >= right - 30.0 * scale && position.x < right
+        if index >= count || !self.tab_bar_at(position) {
+            return false;
+        }
+
+        let scale = self.scale_factor.max(1.0);
+        let x = position.x / scale;
+        let strip_width = self.tab_strip_width();
+
+        if x < 0.0 || x >= strip_width {
+            return false;
+        }
+
+        let tab_width = self.tab_width(count);
+        let scroll = self.effective_tab_scroll(count);
+
+        let right = (index + 1) as f64 * tab_width - scroll;
+
+        x >= right - 30.0 && x < right
+    }
+
+    pub fn scroll_tabs(&mut self, delta: f64, count: usize) -> bool {
+        let maximum = self.max_tab_scroll(count);
+        let current = self.effective_tab_scroll(count);
+
+        let next = (current + delta).clamp(0.0, maximum);
+
+        if (next - self.tab_scroll).abs() <= f64::EPSILON {
+            return false;
+        }
+
+        self.tab_scroll = next;
+        self.layout_dirty = true;
+
+        true
+    }
+
+    pub fn ensure_tab_visible(&mut self, index: usize, count: usize) -> bool {
+        if index >= count {
+            return false;
+        }
+
+        let strip_width = self.tab_strip_width();
+        let tab_width = self.tab_width(count);
+        let maximum = self.max_tab_scroll(count);
+
+        let tab_left = index as f64 * tab_width;
+        let tab_right = tab_left + tab_width;
+
+        let mut next = self.effective_tab_scroll(count);
+
+        if tab_left < next {
+            next = tab_left;
+        } else if tab_right > next + strip_width {
+            next = tab_right - strip_width;
+        }
+
+        next = next.clamp(0.0, maximum);
+
+        if (next - self.tab_scroll).abs() <= f64::EPSILON {
+            return false;
+        }
+
+        self.tab_scroll = next;
+        self.layout_dirty = true;
+
+        true
+    }
+
+    fn logical_width(&self) -> f64 {
+        self.size.width as f64 / self.scale_factor.max(1.0)
+    }
+
+    fn tab_strip_width(&self) -> f64 {
+        (self.logical_width() - NEW_TAB_WIDTH).max(1.0)
     }
 
     fn tab_width(&self, count: usize) -> f64 {
+        let strip_width = self.tab_strip_width();
+
         if count == 0 {
-            return TAB_WIDTH;
+            return strip_width;
         }
-        let logical_width = self.size.width as f64 / self.scale_factor.max(1.0);
-        ((logical_width - NEW_TAB_WIDTH) / count as f64)
-            .min(TAB_WIDTH)
-            .max(72.0)
+
+        (strip_width / count as f64).max(MIN_TAB_WIDTH)
+    }
+
+    fn max_tab_scroll(&self, count: usize) -> f64 {
+        if count == 0 {
+            return 0.0;
+        }
+
+        let total_width = self.tab_width(count) * count as f64;
+
+        (total_width - self.tab_strip_width()).max(0.0)
+    }
+
+    fn effective_tab_scroll(&self, count: usize) -> f64 {
+        self.tab_scroll.clamp(0.0, self.max_tab_scroll(count))
     }
 
     pub fn set_theme(&mut self, theme: RenderTheme) {
@@ -744,33 +853,69 @@ impl Renderer {
         let padding = self.options.padding as f32 * scale;
         let row_height = self.font_layout.cell_height as f32 * scale;
         let cell_width = self.font_layout.cell_width as f32 * scale;
+
         let foreground = self.options.theme.foreground;
-        let ui_areas = self.ui_buffers.iter().enumerate().map(|(index, buffer)| {
-            let left = if index < tabs.len() {
-                index as f32 * tab_width * scale + 10.0 * scale
-            } else {
-                tabs.len() as f32 * tab_width * scale + 11.0 * scale
-            };
-            let right = if index < tabs.len() {
-                (index + 1) as f32 * tab_width * scale
-            } else {
-                tabs.len() as f32 * tab_width * scale + NEW_TAB_WIDTH as f32 * scale
-            };
-            TextArea {
-                buffer,
-                left,
-                top: 6.0 * scale,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: left as i32,
-                    top: 0,
-                    right: right as i32,
-                    bottom: (TAB_BAR_HEIGHT as f32 * scale) as i32,
-                },
-                default_color: glyph_color(foreground),
-                custom_glyphs: &[],
-            }
-        });
+
+        let tab_strip_width = self.tab_strip_width() as f32;
+
+        let tab_scroll = self.effective_tab_scroll(tabs.len()) as f32;
+
+        let logical_width = self.logical_width() as f32;
+
+        let ui_areas = self
+            .ui_buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, buffer)| {
+                if index < tabs.len() {
+                    let tab_left = index as f32 * tab_width - tab_scroll;
+
+                    let tab_right = tab_left + tab_width;
+
+                    let visible_left = tab_left.max(0.0);
+
+                    let visible_right = tab_right.min(tab_strip_width);
+
+                    if visible_right <= visible_left {
+                        return None;
+                    }
+
+                    let left = (tab_left + 10.0) * scale;
+
+                    Some(TextArea {
+                        buffer,
+                        left,
+                        top: 6.0 * scale,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: (visible_left * scale).ceil() as i32,
+                            top: 0,
+                            right: (visible_right * scale).floor() as i32,
+                            bottom: (TAB_BAR_HEIGHT as f32 * scale) as i32,
+                        },
+                        default_color: glyph_color(foreground),
+                        custom_glyphs: &[],
+                    })
+                } else {
+                    // "+" всегда фиксирован справа и не scroll'ится.
+                    let left = (tab_strip_width + 11.0) * scale;
+
+                    Some(TextArea {
+                        buffer,
+                        left,
+                        top: 6.0 * scale,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: (tab_strip_width * scale).ceil() as i32,
+                            top: 0,
+                            right: (logical_width * scale).floor() as i32,
+                            bottom: (TAB_BAR_HEIGHT as f32 * scale) as i32,
+                        },
+                        default_color: glyph_color(foreground),
+                        custom_glyphs: &[],
+                    })
+                }
+            });
         let pane_buffers = &self.pane_buffers;
         let pane_areas = panes.iter().flat_map(move |pane| {
             pane_buffers
@@ -867,14 +1012,37 @@ impl Renderer {
 
     fn build_chrome_rectangles(&mut self, tabs: &[TabLabel]) {
         let scale = self.scale_factor as f32;
+
         let tab_width = self.tab_width(tabs.len()) as f32;
+
+        let tab_scroll = self.effective_tab_scroll(tabs.len()) as f32;
+
+        let strip_width = self.tab_strip_width() as f32;
+
         for (index, tab) in tabs.iter().enumerate() {
+            let left = index as f32 * tab_width - tab_scroll;
+
+            let right = left + tab_width;
+
+            let visible_left = left.max(0.0);
+            let visible_right = right.min(strip_width);
+
+            if visible_right <= visible_left {
+                continue;
+            }
+
+            let width = ((visible_right - visible_left) * scale - scale).max(0.0);
+
+            if width <= 0.0 {
+                continue;
+            }
+
             push_rect(
                 &mut self.rect_scratch,
                 ViewportRect {
-                    x: index as f32 * tab_width * scale,
+                    x: visible_left * scale,
                     y: 0.0,
-                    width: tab_width * scale - scale,
+                    width,
                     height: TAB_BAR_HEIGHT as f32 * scale,
                 },
                 if tab.active {

@@ -416,6 +416,7 @@ impl Application {
                 }
             }
         }
+        self.ensure_active_tab_visible();
         self.resize_active_panes();
         self.process_pty_events();
         self.persist_workspace();
@@ -495,6 +496,7 @@ impl Application {
         self.pending_pinned_close = None;
         self.active_tab = index;
         self.selecting = None;
+        self.ensure_active_tab_visible();
         self.resize_active_panes();
         self.persist_workspace();
         self.update_window_title();
@@ -522,6 +524,9 @@ impl Application {
 
         self.tabs.insert(target, tab);
         self.active_tab = target;
+
+        self.ensure_active_tab_visible();
+        self.resize_active_panes();
 
         self.pending_pinned_close = None;
         self.persist_workspace();
@@ -571,6 +576,8 @@ impl Application {
         self.tabs.swap(current, target);
         self.active_tab = target;
 
+        self.ensure_active_tab_visible();
+
         self.pending_pinned_close = None;
         self.persist_workspace();
         self.update_window_title();
@@ -582,6 +589,18 @@ impl Application {
     }
     fn active_tab_mut(&mut self) -> &mut TabSession {
         &mut self.tabs[self.active_tab]
+    }
+    fn ensure_active_tab_visible(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        let index = self.active_tab;
+        let count = self.tabs.len();
+
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ensure_tab_visible(index, count);
+        }
     }
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
@@ -637,6 +656,8 @@ impl Application {
             return;
         };
         renderer.resize(window.inner_size(), window.scale_factor());
+
+        self.ensure_active_tab_visible();
         self.resize_active_panes();
         self.request_redraw();
     }
@@ -1877,6 +1898,49 @@ impl Application {
 
     fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
         if self.tabs.is_empty() {
+            return;
+        }
+        // Если mouse находится над tab bar,
+        // wheel/trackpad scroll'ит tabs, а не terminal.
+        if self
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.tab_bar_at(self.cursor_position))
+        {
+            let amount = match delta {
+                MouseScrollDelta::LineDelta(x, y) => {
+                    let axis = if x.abs() > y.abs() {
+                        x as f64
+                    } else {
+                        y as f64
+                    };
+
+                    -axis * 48.0
+                }
+
+                MouseScrollDelta::PixelDelta(position) => {
+                    let axis = if position.x.abs() > position.y.abs() {
+                        position.x
+                    } else {
+                        position.y
+                    };
+
+                    -axis
+                }
+            };
+
+            let count = self.tabs.len();
+
+            let changed = if let Some(renderer) = &mut self.renderer {
+                renderer.scroll_tabs(amount, count)
+            } else {
+                false
+            };
+
+            if changed {
+                self.request_redraw();
+            }
+
             return;
         }
         if let Some((pane, _)) = self.pane_at(self.cursor_position) {
